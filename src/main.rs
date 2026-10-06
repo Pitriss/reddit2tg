@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = Config::load(&cli.config)?;
     let db = Db::new(&cfg.storage.path)?;
-    let reddit = RedditClient::new(&cfg)?;
+    let reddit = RedditClient::new(&cfg, db.clone())?;
     let telegram = TelegramClient::new(
         &cfg.telegram.bot_token,
         cfg.telegram.chat_id,

@@ -12,11 +12,13 @@ The target deployment is Linux/Devuan without Rust, Cargo, OpenSSL, or a system 
 - SQLite mapping, Matrix `/sync` checkpoint and Telegram `getUpdates` offset
 - event deduplication
 - Reddit message requests become `REQUEST · ...` topics with `/accept` and `/decline`
-- Matrix JWT is automatically re-minted from the logged-in Reddit browser cookie set (`reddit_session`, with `token_v2`/CSRF refresh fallbacks)
+- Matrix JWT is automatically re-minted from the logged-in Reddit browser cookie set without requiring a browser on the bridge host
+- successful Reddit -> Telegram delivery advances Reddit read markers (`m.fully_read`, `m.read`, `m.read.private`)
+- failed automatic Reddit authentication refresh raises one deduplicated warning in Telegram General and one recovery message after service resumes
 - no inbound TCP port and no Telegram webhook
 - first Matrix sync establishes a checkpoint and deliberately does not replay history
 
-Not implemented yet: media, reactions, edits/deletes, read receipts, typing, starting a brand-new Reddit DM from Telegram.
+Not implemented yet: media, reactions, edits/deletes, typing, starting a brand-new Reddit DM from Telegram, or reliable counterparty "seen" receipts (Reddit does not expose them through this Matrix sync stream).
 
 ## Configuration values
 
@@ -24,7 +26,7 @@ Not implemented yet: media, reactions, edits/deletes, read receipts, typing, sta
 
 | Config key | Meaning |
 | --- | --- |
-| `reddit.session` | Cookie-header-shaped Reddit browser session containing `reddit_session`; `token_v2` and `csrf_token` are used when available |
+| `reddit.session` | Cookie-header-shaped Reddit browser session containing `reddit_session`; other cookies such as `token_v2`, `csrf_token`, `loid`, `session_tracker` and `edgebucket` are retained when available |
 | `telegram.bot_token` | Telegram Bot API token issued by `@BotFather` |
 | `telegram.chat_id` | numeric ID of the private Telegram forum supergroup used by the bridge |
 | `telegram.operator_user_id` | numeric Telegram user ID of the only account allowed to relay messages to Reddit |
@@ -142,7 +144,11 @@ unset TG_BOT_TOKEN
 
 ## Reddit authentication
 
-`reddit2tg` does not need your Reddit password. Current Reddit Chat authentication is refreshed through `POST https://www.reddit.com/svc/shreddit/token`. The bridge uses cookies from an already logged-in Reddit browser session. `reddit_session` is required. If Firefox also has a current `token_v2`, the bridge can use it directly; otherwise it uses `csrf_token` when present or attempts to obtain CSRF from Reddit `/login/` before calling `/svc/shreddit/token`.
+`reddit2tg` does not need your Reddit password and does not need Firefox/Chromium on the server. The bridge uses cookies copied from an already logged-in Reddit browser session. `reddit_session` is the only mandatory cookie. A current `token_v2` may be reused at startup, but automatic long-running refresh does not depend on it.
+
+For automatic refresh, `reddit2tg` requests `https://www.reddit.com/chat/` with the saved Reddit cookie jar **after removing the `token_v2` cookie**. Reddit then server-renders a fresh short-lived Matrix JWT into the `<rs-app token="...">` bootstrap element. The bridge extracts that JWT, registers it with `https://matrix.redditspace.com/_matrix/client/v3/login` using Reddit's `com.reddit.token` login type, verifies it with Matrix `/account/whoami`, and stores only this short-lived Matrix session in SQLite. If `/chat/` minting fails and a `csrf_token` cookie is available, `/svc/shreddit/token` is retained as a fallback.
+
+The long-lived `reddit_session` remains only in `config.toml`; it is not copied into SQLite.
 
 ### 1. Log in to Reddit normally
 
@@ -184,7 +190,7 @@ session = "reddit_session=...; token_v2=...; loid=...; session_tracker=...; edge
 homeserver = "https://matrix.redditspace.com"
 ```
 
-`reddit_session` must be present. `csrf_token` is not mandatory in Firefox: `reddit2tg` first tries a current `token_v2`, then the configured `csrf_token` if available, and finally attempts to obtain CSRF from Reddit `/login/`. Additional Reddit cookies are retained because they make the request resemble the established browser session. Do not commit or share this value.
+`reddit_session` must be present. `token_v2` and `csrf_token` are optional. A current `token_v2` can speed up initial startup; during automatic refresh it is deliberately omitted from the `/chat/` request so Reddit mints a new Matrix JWT. `csrf_token` is used only by the fallback `/svc/shreddit/token` flow. Additional Reddit cookies are retained because they belong to the established browser session. Do not commit or share this value.
 
 ### 3. Manual browser method
 
@@ -198,9 +204,20 @@ For Chrome, Chromium, Brave or Edge the values are under **F12 -> Application ->
 
 ### 4. What reddit2tg does with the cookies
 
-At authentication time `reddit2tg` first probes a saved `token_v2` against Matrix when one exists. If Matrix rejects it or it is absent, the bridge obtains CSRF from the `csrf_token` cookie or from Reddit `/login/`, then sends it to `POST /svc/shreddit/token` together with the saved Reddit cookies and Reddit-style Origin/Referer headers. The resulting Matrix Chat JWT is verified with `https://matrix.redditspace.com/_matrix/client/v3/account/whoami`.
+At startup, `reddit2tg` first tries a still-valid short-lived Matrix session saved in SQLite. If none is usable, it may probe the configured browser `token_v2`. Before expiry (controlled by `bridge.refresh_before_secs`), or after the first Matrix `401 M_UNKNOWN_TOKEN`, the bridge performs one automatic refresh:
 
-The Matrix token is short-lived and is refreshed automatically. When Reddit eventually expires or invalidates the browser session itself, repeat the cookie-extraction step and replace `reddit.session`. Logging out of Reddit sessions or changing account security settings may invalidate it earlier.
+1. remove `token_v2` from the outgoing Reddit cookie header,
+2. `GET https://www.reddit.com/chat/`,
+3. extract and HTML-decode the JSON from `<rs-app token="...">`,
+4. register the returned JWT through Matrix `/login` with `type = "com.reddit.token"`,
+5. verify `/account/whoami`,
+6. save the short-lived Matrix token, user ID and expiry in SQLite.
+
+If `/chat/` refresh fails and `csrf_token` exists, the bridge also tries `POST /svc/shreddit/token` as a fallback. A Matrix operation that receives HTTP 401 invalidates the cached token, performs one refresh, and retries the operation once. It does not loop infinitely on an invalid token.
+
+When automatic refresh cannot recover, the daemon stays alive and continues retrying with backoff. The bot sends one warning to the Telegram **General** topic. Repeated failures are deduplicated through SQLite. After authentication works again, one recovery message is sent and the alert state is cleared. No cookie, Matrix token or HTTP response body containing credentials is copied into the Telegram alert.
+
+When Reddit eventually expires or invalidates `reddit_session` itself, repeat the Firefox/browser cookie-extraction step, replace `reddit.session` in the configuration and restart the service. Logging out of Reddit sessions or changing account security settings may invalidate it earlier.
 
 ## Create a local test configuration
 
@@ -255,7 +272,7 @@ Run the checks:
 The check validates, among other things:
 
 - the configured Reddit Cookie header contains `reddit_session`
-- an existing `token_v2` works, or Reddit `/svc/shreddit/token` can mint a Matrix Chat token
+- an existing short-lived Matrix session/token works, or Reddit `/chat/` can mint and register a fresh Matrix Chat token
 - Matrix `/account/whoami` succeeds
 - Telegram bot token is valid
 - no Telegram webhook is active
@@ -275,6 +292,12 @@ For a foreground test on the build machine:
 Stop it with `Ctrl+C`.
 
 Do not simultaneously run another process using `getUpdates` with the same Telegram bot token. Bot API updates are a single stream and competing consumers will interfere with each other.
+
+### Read receipts
+
+After an incoming Reddit text/notice has been successfully delivered to its Telegram topic, reddit2tg queues a Matrix read marker for that event and sends all three keys used by Reddit/Matrix clients: `m.fully_read`, `m.read` and `m.read.private`. The pending marker is persisted before the HTTP request, so a transient failure can be retried without sending the Telegram message twice.
+
+This means the bridge can clear the Reddit-side unread state for messages it has forwarded. It does **not** mean the remote Reddit user has seen messages sent by you: the Reddit homeserver does not expose dependable counterparty read receipts in the `/sync` stream, and Telegram Bot API likewise does not tell a bot that a human opened a message. reddit2tg therefore does not invent a false "seen" state.
 
 ## Build on Debian 13
 
@@ -416,13 +439,17 @@ The archive and Debian package are both produced by `scripts/package-release.sh`
 
 `reddit.session` (the Reddit cookie header) and the Telegram bot token are credentials. `config.toml` should be mode `0640` or stricter and readable only by root and the `reddit2tg` service group on the target system. A developer-local `config.toml` can simply use mode `0600`.
 
-The SQLite database does not need to store either credential in v0.1.
+The SQLite database stores the short-lived Matrix access token, its user ID/expiry, pending read markers and the deduplicated authentication-alert state. It does **not** store the long-lived `reddit_session` or Telegram bot token. `reddit2tg` forces the SQLite database file to mode `0600`; the containing `/var/lib/reddit2tg` directory is installed as `0750`. Treat the database as sensitive runtime state.
 
 The Reddit Chat protocol used here is not an official public Reddit API and can change without notice.
 
+## AI-assisted development
+
+A significant portion of the source code and documentation in this project has been generated or modified with the assistance of AI tools. Automated tests and successful builds do not guarantee correctness or security. Human review is strongly recommended before production deployment, especially for authentication, credential handling, networking, packaging and service-management changes.
+
 ## Verification status
 
-The `amd64` MUSL build has been verified locally on Debian 13 as a static-PIE executable. `reddit2tg 0.1.4` has also been verified end-to-end with a real Reddit Chat DM mapped to a Telegram forum topic and replies relayed back to Reddit. The `arm64` and `armhf` release targets are built remotely by GitHub Actions and should be validated from the first multi-architecture workflow run before publishing the release tag.
+The `amd64` MUSL build has been verified locally on Debian 13 as a static-PIE executable. `reddit2tg 0.1.4` has also been verified end-to-end with a real Reddit Chat DM mapped to a Telegram forum topic and replies relayed back to Reddit. The `amd64`, `arm64` and `armhf` targets all passed the first GitHub Actions multi-architecture build for v0.1.4, including static-link verification and `.deb`/`.tar.gz` packaging. The v0.1.5 authentication/read-receipt changes should be validated by the same remote workflow before tagging the release.
 
 ## References
 
@@ -433,6 +460,6 @@ The `amd64` MUSL build has been verified locally on Debian 13 as a static-PIE ex
 
 ### Debugging Telegram topics
 
-Version 0.1.4 keeps the INFO-level diagnostics for Telegram forum-topic routing and also resolves missing DM identities through Matrix `joined_members`. Existing generic `Reddit chat` topics are renamed automatically when the Reddit identity becomes available. Successful Telegram -> Reddit sends now log the resulting Matrix event ID. Version 0.1.3 added the original topic diagnostics. When a Reddit room creates a topic, the log prints both `matrix_room_id` and the returned `telegram_thread_id`. When the operator replies in Telegram, the log prints the incoming `message_thread_id` and `is_topic_message`. `sendMessage` also warns if Telegram returns a different or missing thread ID than the one requested.
+Version 0.1.5 retains the INFO-level diagnostics from 0.1.4 and adds authentication refresh/read-marker diagnostics. Version 0.1.4 keeps the INFO-level diagnostics for Telegram forum-topic routing and also resolves missing DM identities through Matrix `joined_members`. Existing generic `Reddit chat` topics are renamed automatically when the Reddit identity becomes available. Successful Telegram -> Reddit sends now log the resulting Matrix event ID. Version 0.1.3 added the original topic diagnostics. When a Reddit room creates a topic, the log prints both `matrix_room_id` and the returned `telegram_thread_id`. When the operator replies in Telegram, the log prints the incoming `message_thread_id` and `is_topic_message`. `sendMessage` also warns if Telegram returns a different or missing thread ID than the one requested.
 
 This makes it possible to verify that the SQLite mapping and Telegram's actual topic IDs match.

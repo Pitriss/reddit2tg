@@ -137,6 +137,16 @@ impl TelegramClient {
         Ok(())
     }
 
+    pub async fn send_general(&self, text: &str) -> Result<()> {
+        for chunk in split_text(text, 4000) {
+            let _: Message = self.call("sendMessage", &serde_json::json!({
+                "chat_id": self.chat_id,
+                "text": chunk,
+            })).await?;
+        }
+        Ok(())
+    }
+
     pub async fn get_updates(&self, offset: i64, timeout: u64) -> Result<Vec<Update>> {
         self.call("getUpdates", &GetUpdatesBody {
             offset,

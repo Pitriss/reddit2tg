@@ -8,7 +8,10 @@ use tracing::{error, info, warn};
 use crate::{
     config::Config,
     db::{Db, RoomMap},
-    reddit::{InvitedRoom, JoinedRoom, RedditClient, member_display_name, matrix_localpart},
+    reddit::{
+        InvitedRoom, JoinedRoom, RedditClient, is_auth_refresh_error, member_display_name,
+        matrix_localpart,
+    },
     telegram::{Message, TelegramClient},
 };
 
@@ -26,14 +29,34 @@ impl Bridge {
     }
 
     pub async fn check(&self) -> Result<()> {
-        let session = self.reddit.authenticate().await?;
         self.telegram.probe().await?;
-        info!(user_id = %session.user_id, "configuration probe successful");
+        let session = self.reddit.authenticate().await?;
+        info!(
+            user_id = %session.user_id,
+            expires_in_secs = ?session.expires_in_secs(),
+            "configuration probe successful"
+        );
         Ok(())
     }
 
     pub async fn run(self) -> Result<()> {
-        self.check().await?;
+        self.telegram.probe().await?;
+        match self.reddit.authenticate().await {
+            Ok(session) => {
+                info!(
+                    user_id = %session.user_id,
+                    expires_in_secs = ?session.expires_in_secs(),
+                    "configuration probe successful"
+                );
+                self.notify_auth_recovered_once().await;
+            }
+            Err(error) if is_auth_refresh_error(&error) => {
+                error!(error = %error, "Reddit authentication unavailable at startup; bridge will keep retrying");
+                self.notify_auth_failure_once().await;
+            }
+            Err(error) => return Err(error),
+        }
+
         let matrix = self.clone();
         let telegram = self.clone();
         let matrix_task = tokio::spawn(async move { matrix.matrix_loop().await });
@@ -51,8 +74,14 @@ impl Bridge {
         let mut backoff = 1u64;
         loop {
             match self.matrix_iteration().await {
-                Ok(()) => backoff = 1,
+                Ok(()) => {
+                    backoff = 1;
+                    self.notify_auth_recovered_once().await;
+                }
                 Err(err) => {
+                    if is_auth_refresh_error(&err) {
+                        self.notify_auth_failure_once().await;
+                    }
                     error!(error = %err, backoff_secs = backoff, "Matrix sync iteration failed");
                     sleep(Duration::from_secs(backoff)).await;
                     backoff = (backoff * 2).min(60);
@@ -62,6 +91,7 @@ impl Bridge {
     }
 
     async fn matrix_iteration(&self) -> Result<()> {
+        self.flush_pending_read_receipts().await?;
         let since = self.db.get_meta("matrix_next_batch")?;
         let first_sync = since.is_none();
         let sync = self.reddit.sync(
@@ -152,8 +182,92 @@ impl Bridge {
             };
             self.telegram.send_text(mapping.telegram_thread_id, &rendered).await?;
             self.db.mark_matrix_event_seen(&event.event_id, room_id)?;
+            if event.sender != own {
+                self.db.queue_read_receipt(room_id, &event.event_id)?;
+                self.flush_read_receipt(room_id, &event.event_id).await?;
+            }
         }
         Ok(())
+    }
+
+
+    async fn flush_pending_read_receipts(&self) -> Result<()> {
+        for (room_id, event_id) in self.db.pending_read_receipts()? {
+            self.flush_read_receipt(&room_id, &event_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn flush_read_receipt(&self, room_id: &str, event_id: &str) -> Result<()> {
+        match self
+            .reddit
+            .set_read_marker(room_id, event_id, self.cfg.bridge.refresh_before_secs)
+            .await
+        {
+            Ok(()) => {
+                self.db.clear_read_receipt(room_id, event_id)?;
+                info!(
+                    matrix_room_id = %room_id,
+                    matrix_event_id = %event_id,
+                    "Reddit read marker updated after Telegram delivery"
+                );
+            }
+            Err(error) if is_auth_refresh_error(&error) => return Err(error),
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    matrix_room_id = %room_id,
+                    matrix_event_id = %event_id,
+                    "Reddit read marker update failed; queued for retry"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn notify_auth_failure_once(&self) {
+        match self.db.auth_alert_active() {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                warn!(error = %error, "cannot read auth alert state");
+                return;
+            }
+        }
+
+        let text = "⚠ reddit2tg: automatická obnova Reddit autentizace selhala. Bridge bude dál zkoušet obnovu. Pokud se stav sám neopraví, obnov reddit.session v /etc/reddit2tg/config.toml a restartuj službu. Žádné přihlašovací údaje nejsou součástí této zprávy.";
+        match self.telegram.send_general(text).await {
+            Ok(()) => {
+                if let Err(error) = self.db.set_auth_alert_active(true) {
+                    warn!(error = %error, "auth alert was sent but its state could not be persisted");
+                }
+            }
+            Err(error) => warn!(error = %error, "failed to send Reddit authentication alert to Telegram General"),
+        }
+    }
+
+    async fn notify_auth_recovered_once(&self) {
+        match self.db.auth_alert_active() {
+            Ok(false) => return,
+            Ok(true) => {}
+            Err(error) => {
+                warn!(error = %error, "cannot read auth alert state");
+                return;
+            }
+        }
+
+        match self
+            .telegram
+            .send_general("✅ reddit2tg: Reddit autentizace byla obnovena a bridge znovu funguje.")
+            .await
+        {
+            Ok(()) => {
+                if let Err(error) = self.db.set_auth_alert_active(false) {
+                    warn!(error = %error, "auth recovery was sent but its state could not be persisted");
+                }
+            }
+            Err(error) => warn!(error = %error, "failed to send Reddit authentication recovery to Telegram General"),
+        }
     }
 
     async fn ensure_room_mapping(&self, room_id: &str, title_hint: Option<&str>, status: &str) -> Result<RoomMap> {
@@ -192,6 +306,9 @@ impl Bridge {
             match self.telegram_iteration().await {
                 Ok(()) => backoff = 1,
                 Err(err) => {
+                    if is_auth_refresh_error(&err) {
+                        self.notify_auth_failure_once().await;
+                    }
                     error!(error = %err, backoff_secs = backoff, "Telegram polling iteration failed");
                     sleep(Duration::from_secs(backoff)).await;
                     backoff = (backoff * 2).min(60);

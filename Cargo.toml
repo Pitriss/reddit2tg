@@ -1,12 +1,13 @@
 [package]
 name = "reddit2tg"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Self-hosted Reddit Chat <-> Telegram bridge"
 license = "MIT"
 
 [dependencies]
 anyhow = "1.0"
+base64 = "0.22"
 clap = { version = "4.5", features = ["derive", "env"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }

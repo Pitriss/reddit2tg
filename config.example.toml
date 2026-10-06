@@ -1,6 +1,7 @@
 [reddit]
 # Cookie-header-shaped value from a logged-in www.reddit.com session.
-# Must contain at least reddit_session and csrf_token. The Firefox helper script can copy it safely.
+# Must contain reddit_session. token_v2/csrf_token and other Reddit cookies are optional helpers.
+# The Firefox helper script can copy the available cookie set safely.
 session = "reddit_session=PASTE_VALUE; csrf_token=PASTE_VALUE"
 homeserver = "https://matrix.redditspace.com"
 
