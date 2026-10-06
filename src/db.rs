@@ -27,6 +27,16 @@ pub struct StoredMatrixSession {
     pub expires_at_ms: Option<i64>,
 }
 
+struct MessageMapInsert<'a> {
+    event_id: &'a str,
+    room_id: &'a str,
+    thread_id: i64,
+    message_id: i64,
+    direction: &'a str,
+    message_kind: &'a str,
+    part_index: i64,
+}
+
 impl Db {
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
@@ -93,6 +103,25 @@ impl Db {
               event_id TEXT NOT NULL,
               updated_at INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS message_map (
+              matrix_event_id TEXT NOT NULL,
+              matrix_room_id TEXT NOT NULL,
+              telegram_thread_id INTEGER NOT NULL,
+              telegram_message_id INTEGER NOT NULL,
+              direction TEXT NOT NULL,
+              message_kind TEXT NOT NULL DEFAULT 'text',
+              part_index INTEGER NOT NULL DEFAULT 0,
+              created_at INTEGER NOT NULL,
+              PRIMARY KEY(matrix_event_id, telegram_thread_id, telegram_message_id),
+              UNIQUE(telegram_thread_id, telegram_message_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_message_map_matrix
+              ON message_map(matrix_event_id, telegram_thread_id);
+
+            CREATE INDEX IF NOT EXISTS idx_message_map_room
+              ON message_map(matrix_room_id, created_at);
             "#,
         )?;
         Ok(())
@@ -249,22 +278,110 @@ impl Db {
         Ok(found.is_some())
     }
 
-    pub fn mark_matrix_event_seen(&self, event_id: &str, room_id: &str) -> Result<()> {
-        let conn = self.connect()?;
-        conn.execute(
+    pub fn record_matrix_delivery(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        thread_id: i64,
+        telegram_message_ids: &[i64],
+    ) -> Result<()> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT OR IGNORE INTO seen_matrix_events(event_id, matrix_room_id, created_at) VALUES(?1, ?2, ?3)",
             params![event_id, room_id, now_unix()],
         )?;
+        for (part_index, message_id) in telegram_message_ids.iter().enumerate() {
+            insert_message_map(
+                &tx,
+                MessageMapInsert {
+                    event_id,
+                    room_id,
+                    thread_id,
+                    message_id: *message_id,
+                    direction: "matrix_to_telegram",
+                    message_kind: "text",
+                    part_index: part_index as i64,
+                },
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
-    pub fn replace_room_mapping_and_mark_seen(
+    pub fn record_telegram_delivery(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        thread_id: i64,
+        telegram_message_id: i64,
+    ) -> Result<()> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT OR IGNORE INTO seen_matrix_events(event_id, matrix_room_id, created_at) VALUES(?1, ?2, ?3)",
+            params![event_id, room_id, now_unix()],
+        )?;
+        insert_message_map(
+            &tx,
+            MessageMapInsert {
+                event_id,
+                room_id,
+                thread_id,
+                message_id: telegram_message_id,
+                direction: "telegram_to_matrix",
+                message_kind: "text",
+                part_index: 0,
+            },
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn telegram_message_for_matrix(
+        &self,
+        matrix_event_id: &str,
+        thread_id: i64,
+    ) -> Result<Option<i64>> {
+        let conn = self.connect()?;
+        Ok(conn
+            .query_row(
+                r#"SELECT telegram_message_id
+                   FROM message_map
+                   WHERE matrix_event_id = ?1 AND telegram_thread_id = ?2
+                   ORDER BY telegram_message_id DESC
+                   LIMIT 1"#,
+                params![matrix_event_id, thread_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn matrix_event_for_telegram(
+        &self,
+        thread_id: i64,
+        telegram_message_id: i64,
+    ) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        Ok(conn
+            .query_row(
+                r#"SELECT matrix_event_id
+                   FROM message_map
+                   WHERE telegram_thread_id = ?1 AND telegram_message_id = ?2
+                   LIMIT 1"#,
+                params![thread_id, telegram_message_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn replace_room_mapping_and_record_deliveries(
         &self,
         room_id: &str,
         thread_id: i64,
         title: &str,
         status: &str,
-        event_ids: &[String],
+        deliveries: &[(String, i64, i64)],
     ) -> Result<()> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
@@ -278,10 +395,22 @@ impl Db {
                  updated_at = excluded.updated_at"#,
             params![room_id, thread_id, title, status, now_unix()],
         )?;
-        for event_id in event_ids {
+        for (event_id, message_id, part_index) in deliveries {
             tx.execute(
                 "INSERT OR IGNORE INTO seen_matrix_events(event_id, matrix_room_id, created_at) VALUES(?1, ?2, ?3)",
                 params![event_id, room_id, now_unix()],
+            )?;
+            insert_message_map(
+                &tx,
+                MessageMapInsert {
+                    event_id,
+                    room_id,
+                    thread_id,
+                    message_id: *message_id,
+                    direction: "matrix_to_telegram",
+                    message_kind: "text",
+                    part_index: *part_index,
+                },
             )?;
         }
         tx.commit()?;
@@ -327,6 +456,34 @@ impl Db {
             [cutoff],
         )?)
     }
+}
+
+fn insert_message_map(tx: &rusqlite::Transaction<'_>, entry: MessageMapInsert<'_>) -> Result<()> {
+    tx.execute(
+        r#"INSERT INTO message_map(
+             matrix_event_id, matrix_room_id, telegram_thread_id,
+             telegram_message_id, direction, message_kind, part_index, created_at
+           )
+           VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+           ON CONFLICT(telegram_thread_id, telegram_message_id) DO UPDATE SET
+             matrix_event_id = excluded.matrix_event_id,
+             matrix_room_id = excluded.matrix_room_id,
+             direction = excluded.direction,
+             message_kind = excluded.message_kind,
+             part_index = excluded.part_index,
+             created_at = excluded.created_at"#,
+        params![
+            entry.event_id,
+            entry.room_id,
+            entry.thread_id,
+            entry.message_id,
+            entry.direction,
+            entry.message_kind,
+            entry.part_index,
+            now_unix()
+        ],
+    )?;
+    Ok(())
 }
 
 fn room_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RoomMap> {

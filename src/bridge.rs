@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -50,6 +50,7 @@ struct HistoryReplayMessage {
     outgoing: bool,
     sender_name: String,
     body: String,
+    reply_to_event_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -274,6 +275,7 @@ impl Bridge {
                 outgoing,
                 sender_name,
                 body: body.to_owned(),
+                reply_to_event_id: matrix_reply_target(&event.content),
             });
         }
 
@@ -301,17 +303,39 @@ impl Bridge {
             return Ok((room.telegram_thread_id, report));
         }
 
+        let mut replay_targets = HashMap::new();
         for message in &replay.messages {
-            self.telegram
+            let reply_to_message_id =
+                if let Some(reply_event_id) = message.reply_to_event_id.as_deref() {
+                    if let Some(message_id) = replay_targets.get(reply_event_id).copied() {
+                        Some(message_id)
+                    } else {
+                        self.db
+                            .telegram_message_for_matrix(reply_event_id, room.telegram_thread_id)?
+                    }
+                } else {
+                    None
+                };
+
+            let telegram_message_ids = self
+                .telegram
                 .send_history_message(
                     room.telegram_thread_id,
                     message.outgoing,
                     &message.sender_name,
                     &message.body,
+                    reply_to_message_id,
                 )
                 .await?;
-            self.db
-                .mark_matrix_event_seen(&message.event_id, &room.matrix_room_id)?;
+            if let Some(message_id) = telegram_message_ids.first().copied() {
+                replay_targets.insert(message.event_id.clone(), message_id);
+            }
+            self.db.record_matrix_delivery(
+                &room.matrix_room_id,
+                &message.event_id,
+                room.telegram_thread_id,
+                &telegram_message_ids,
+            )?;
         }
         info!(
             matrix_room_id = %room.matrix_room_id,
@@ -364,34 +388,47 @@ impl Bridge {
         }
 
         let new_thread_id = self.telegram.create_topic(&replay.title).await?;
+        let mut replay_targets = HashMap::new();
+        let mut deliveries = Vec::new();
         for message in &replay.messages {
-            if let Err(error) = self
+            let reply_to_message_id = message
+                .reply_to_event_id
+                .as_deref()
+                .and_then(|event_id| replay_targets.get(event_id).copied());
+
+            let telegram_message_ids = match self
                 .telegram
                 .send_history_message(
                     new_thread_id,
                     message.outgoing,
                     &message.sender_name,
                     &message.body,
+                    reply_to_message_id,
                 )
                 .await
             {
-                self.close_incomplete_reset_topic(new_thread_id, &replay.title)
-                    .await;
-                return Err(error).context("replay history into new Telegram topic");
+                Ok(message_ids) => message_ids,
+                Err(error) => {
+                    self.close_incomplete_reset_topic(new_thread_id, &replay.title)
+                        .await;
+                    return Err(error).context("replay history into new Telegram topic");
+                }
+            };
+
+            if let Some(message_id) = telegram_message_ids.first().copied() {
+                replay_targets.insert(message.event_id.clone(), message_id);
+            }
+            for (part_index, message_id) in telegram_message_ids.into_iter().enumerate() {
+                deliveries.push((message.event_id.clone(), message_id, part_index as i64));
             }
         }
 
-        let event_ids = replay
-            .messages
-            .iter()
-            .map(|message| message.event_id.clone())
-            .collect::<Vec<_>>();
-        if let Err(error) = self.db.replace_room_mapping_and_mark_seen(
+        if let Err(error) = self.db.replace_room_mapping_and_record_deliveries(
             &room.matrix_room_id,
             new_thread_id,
             &replay.title,
             &room.status,
-            &event_ids,
+            &deliveries,
         ) {
             self.close_incomplete_reset_topic(new_thread_id, &replay.title)
                 .await;
@@ -748,10 +785,24 @@ impl Bridge {
             } else {
                 body.to_owned()
             };
-            self.telegram
-                .send_text(mapping.telegram_thread_id, &rendered)
+            let reply_to_message_id =
+                if let Some(reply_event_id) = matrix_reply_target(&event.content) {
+                    self.db
+                        .telegram_message_for_matrix(&reply_event_id, mapping.telegram_thread_id)?
+                } else {
+                    None
+                };
+
+            let telegram_message_ids = self
+                .telegram
+                .send_text_with_reply(mapping.telegram_thread_id, &rendered, reply_to_message_id)
                 .await?;
-            self.db.mark_matrix_event_seen(&event.event_id, room_id)?;
+            self.db.record_matrix_delivery(
+                room_id,
+                &event.event_id,
+                mapping.telegram_thread_id,
+                &telegram_message_ids,
+            )?;
             if event.sender != own {
                 self.db.queue_read_receipt(room_id, &event.event_id)?;
                 self.flush_read_receipt(room_id, &event.event_id).await?;
@@ -891,7 +942,7 @@ impl Bridge {
                     if is_auth_refresh_error(&err) {
                         self.notify_auth_failure_once().await;
                     }
-                    error!(error = %err, backoff_secs = backoff, "Telegram polling iteration failed");
+                    error!(error = %format!("{err:#}"), backoff_secs = backoff, "Telegram polling iteration failed");
                     sleep(Duration::from_secs(backoff)).await;
                     backoff = (backoff * 2).min(60);
                 }
@@ -1091,6 +1142,27 @@ impl Bridge {
             return Ok(());
         }
 
+        let reply_to_event_id = if let Some(reply) = message.reply_to_message.as_ref() {
+            self.db
+                .matrix_event_for_telegram(thread_id, reply.message_id)?
+        } else {
+            None
+        };
+
+        let thread_root_event_id = if let Some(reply_to_event_id) = reply_to_event_id.as_deref() {
+            Some(
+                self.reddit
+                    .reply_thread_root(
+                        &room.matrix_room_id,
+                        reply_to_event_id,
+                        self.cfg.bridge.refresh_before_secs,
+                    )
+                    .await?,
+            )
+        } else {
+            None
+        };
+
         let txn_id = format!("tg-{update_id}-{}", message.message_id);
         let event_id = self
             .reddit
@@ -1098,6 +1170,8 @@ impl Bridge {
                 &room.matrix_room_id,
                 text,
                 &txn_id,
+                thread_root_event_id.as_deref(),
+                reply_to_event_id.as_deref(),
                 self.cfg.bridge.refresh_before_secs,
             )
             .await?;
@@ -1105,10 +1179,16 @@ impl Bridge {
             telegram_thread_id = thread_id,
             matrix_room_id = %room.matrix_room_id,
             matrix_event_id = %event_id,
+            thread_root_matrix_event_id = ?thread_root_event_id,
+            reply_to_matrix_event_id = ?reply_to_event_id,
             "Telegram message forwarded to Reddit"
         );
-        self.db
-            .mark_matrix_event_seen(&event_id, &room.matrix_room_id)?;
+        self.db.record_telegram_delivery(
+            &room.matrix_room_id,
+            &event_id,
+            thread_id,
+            message.message_id,
+        )?;
         Ok(())
     }
 }
@@ -1180,6 +1260,16 @@ fn clean_name(value: &str) -> String {
     base.chars().take(110).collect()
 }
 
+fn matrix_reply_target(content: &Value) -> Option<String> {
+    content
+        .get("m.relates_to")?
+        .get("m.in_reply_to")?
+        .get("event_id")?
+        .as_str()
+        .filter(|event_id| !event_id.is_empty())
+        .map(str::to_owned)
+}
+
 fn startup_event_should_forward(origin_server_ts: i64, cutoff_ms: i64) -> bool {
     origin_server_ts >= cutoff_ms
 }
@@ -1200,9 +1290,30 @@ fn unix_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_history_command, parse_reconcile_names_command, startup_event_should_forward,
-        HistoryCommand, HistoryCommandKind, DEFAULT_HISTORY_LIMIT,
+        matrix_reply_target, parse_history_command, parse_reconcile_names_command,
+        startup_event_should_forward, HistoryCommand, HistoryCommandKind, DEFAULT_HISTORY_LIMIT,
     };
+
+    #[test]
+    fn extracts_matrix_reply_target() {
+        let content = serde_json::json!({
+            "msgtype": "m.text",
+            "body": "reply",
+            "m.relates_to": {
+                "m.in_reply_to": {
+                    "event_id": "$original:reddit"
+                }
+            }
+        });
+        assert_eq!(
+            matrix_reply_target(&content).as_deref(),
+            Some("$original:reddit")
+        );
+        assert_eq!(
+            matrix_reply_target(&serde_json::json!({"msgtype":"m.text","body":"plain"})),
+            None
+        );
+    }
 
     #[test]
     fn startup_cutoff_forwards_only_events_at_or_after_start() {

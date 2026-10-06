@@ -15,6 +15,9 @@ The target deployment is Linux/Devuan without Rust, Cargo, a system OpenSSL inst
 - human-readable Reddit names are resolved for both the remote participant and the local Reddit account
 - generic or stale topic names can be corrected with `/reconcile-names` or `/reconcile_names`
 - successful Reddit -> Telegram delivery advances Reddit-side `m.fully_read`, `m.read`, and `m.read.private` markers
+- replies are bridged in both directions: Reddit represents a reply as a Matrix `m.thread` relation with an `m.in_reply_to` fallback; reddit2tg converts that to a Telegram reply, and Telegram replies are sent back using Reddit's thread relation format
+- SQLite keeps durable Matrix event <-> Telegram message mappings; one Matrix event may map to multiple Telegram message IDs when long text is split into chunks
+- pre-upgrade messages do not have this mapping automatically; `/reload-history` or `/reset-chat` can seed mappings for replayed history
 
 ### History recovery and chat repair
 

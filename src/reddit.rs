@@ -483,11 +483,72 @@ impl RedditClient {
         unreachable!()
     }
 
+    pub async fn reply_thread_root(
+        &self,
+        room_id: &str,
+        reply_to_event_id: &str,
+        refresh_before_secs: u64,
+    ) -> Result<String> {
+        let room = urlencoding::encode(room_id);
+        let event = urlencoding::encode(reply_to_event_id);
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{room}/event/{event}",
+            self.homeserver
+        );
+
+        for attempt in 0..2 {
+            let session = self.ensure_session(refresh_before_secs).await?;
+            let response = self
+                .http
+                .get(&url)
+                .bearer_auth(&session.access_token)
+                .send()
+                .await
+                .context("Matrix reply target lookup failed")?;
+
+            if response.status() == StatusCode::UNAUTHORIZED {
+                if attempt == 0 {
+                    self.refresh_after_unauthorized("reply target lookup")
+                        .await?;
+                    continue;
+                }
+                self.invalidate_session().await?;
+                return Err(auth_error(
+                    "Matrix reply target lookup rejected the refreshed access token",
+                ));
+            }
+
+            if !response.status().is_success() {
+                // A missing/old target must not make a normal reply impossible.
+                // Starting a new Reddit thread rooted at the target is the
+                // closest safe fallback.
+                return Ok(reply_to_event_id.to_owned());
+            }
+
+            let event: Value = response
+                .json()
+                .await
+                .context("Matrix reply target lookup returned invalid JSON")?;
+            let root = event
+                .get("content")
+                .and_then(|content| content.get("m.relates_to"))
+                .filter(|rel| rel.get("rel_type").and_then(Value::as_str) == Some("m.thread"))
+                .and_then(|rel| rel.get("event_id"))
+                .and_then(Value::as_str)
+                .filter(|event_id| !event_id.is_empty())
+                .unwrap_or(reply_to_event_id);
+            return Ok(root.to_owned());
+        }
+        unreachable!()
+    }
+
     pub async fn send_text(
         &self,
         room_id: &str,
         body: &str,
         txn_id: &str,
+        thread_root_event_id: Option<&str>,
+        reply_to_event_id: Option<&str>,
         refresh_before_secs: u64,
     ) -> Result<String> {
         for attempt in 0..2 {
@@ -498,11 +559,19 @@ impl RedditClient {
                 "{}/_matrix/client/v3/rooms/{room}/send/m.room.message/{txn}",
                 self.homeserver
             );
+            let mut content = serde_json::json!({"msgtype":"m.text","body":body});
+            if let (Some(thread_root_event_id), Some(reply_to_event_id)) =
+                (thread_root_event_id, reply_to_event_id)
+            {
+                content["m.relates_to"] =
+                    reddit_reply_relation(thread_root_event_id, reply_to_event_id);
+            }
+
             let response = self
                 .http
                 .put(url)
                 .bearer_auth(&session.access_token)
-                .json(&serde_json::json!({"msgtype":"m.text","body":body}))
+                .json(&content)
                 .send()
                 .await
                 .context("Matrix send message request failed")?;
@@ -516,11 +585,19 @@ impl RedditClient {
                     "Matrix send rejected the refreshed access token",
                 ));
             }
+            let status = response.status();
+            if !status.is_success() {
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|error| format!("<failed to read response body: {error}>"));
+                anyhow::bail!("Matrix send message failed: HTTP {status}: {body}");
+            }
+
             let response: SendResponse = response
-                .error_for_status()
-                .context("Matrix send message failed")?
                 .json()
-                .await?;
+                .await
+                .context("Matrix send message returned invalid JSON")?;
             return Ok(response.event_id);
         }
         unreachable!()
@@ -876,6 +953,17 @@ impl RedditClient {
     }
 }
 
+fn reddit_reply_relation(thread_root_event_id: &str, reply_to_event_id: &str) -> Value {
+    serde_json::json!({
+        "rel_type": "m.thread",
+        "event_id": thread_root_event_id,
+        "m.in_reply_to": {
+            "event_id": reply_to_event_id,
+        },
+        "is_falling_back": thread_root_event_id == reply_to_event_id,
+    })
+}
+
 fn counterpart_from_joined_members(value: &Value, own_user_id: &str) -> Option<(String, String)> {
     let joined = value.get("joined")?.as_object()?;
     for (user_id, member) in joined {
@@ -1062,7 +1150,10 @@ fn truncate(value: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{counterpart_from_members, extract_token_blob, jwt_expires_at_ms, strip_cookie};
+    use super::{
+        counterpart_from_members, extract_token_blob, jwt_expires_at_ms, reddit_reply_relation,
+        strip_cookie,
+    };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
     #[test]
@@ -1071,6 +1162,28 @@ mod tests {
         assert_eq!(
             strip_cookie(value, "token_v2"),
             "reddit_session=abc; loid=xyz"
+        );
+    }
+
+    #[test]
+    fn builds_reddit_thread_reply_relation() {
+        assert_eq!(
+            reddit_reply_relation("$root", "$root"),
+            serde_json::json!({
+                "rel_type": "m.thread",
+                "event_id": "$root",
+                "m.in_reply_to": {"event_id": "$root"},
+                "is_falling_back": true
+            })
+        );
+        assert_eq!(
+            reddit_reply_relation("$root", "$child"),
+            serde_json::json!({
+                "rel_type": "m.thread",
+                "event_id": "$root",
+                "m.in_reply_to": {"event_id": "$child"},
+                "is_falling_back": false
+            })
         );
     }
 

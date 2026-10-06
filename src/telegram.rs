@@ -41,6 +41,7 @@ pub struct Message {
     pub from: Option<User>,
     pub text: Option<String>,
     pub entities: Option<Vec<Value>>,
+    pub reply_to_message: Option<Box<Message>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -167,17 +168,34 @@ impl TelegramClient {
     }
 
     pub async fn send_text(&self, thread_id: i64, text: &str) -> Result<()> {
-        for chunk in split_text(text, 4000) {
-            let sent: Message = self
-                .call(
-                    "sendMessage",
-                    &serde_json::json!({
-                        "chat_id": self.chat_id,
-                        "message_thread_id": thread_id,
-                        "text": chunk,
-                    }),
-                )
-                .await?;
+        self.send_text_with_reply(thread_id, text, None)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn send_text_with_reply(
+        &self,
+        thread_id: i64,
+        text: &str,
+        reply_to_message_id: Option<i64>,
+    ) -> Result<Vec<i64>> {
+        let mut message_ids = Vec::new();
+        for (part_index, chunk) in split_text(text, 4000).into_iter().enumerate() {
+            let mut body = serde_json::json!({
+                "chat_id": self.chat_id,
+                "message_thread_id": thread_id,
+                "text": chunk,
+            });
+            if part_index == 0 {
+                if let Some(reply_to_message_id) = reply_to_message_id {
+                    body["reply_parameters"] = serde_json::json!({
+                        "message_id": reply_to_message_id,
+                        "allow_sending_without_reply": true,
+                    });
+                }
+            }
+
+            let sent: Message = self.call("sendMessage", &body).await?;
             if sent.message_thread_id != Some(thread_id) {
                 tracing::warn!(
                     requested_thread_id = thread_id,
@@ -186,8 +204,9 @@ impl TelegramClient {
                     "Telegram sendMessage returned a different or missing message_thread_id"
                 );
             }
+            message_ids.push(sent.message_id);
         }
-        Ok(())
+        Ok(message_ids)
     }
 
     pub async fn send_history_message(
@@ -196,7 +215,8 @@ impl TelegramClient {
         outgoing: bool,
         sender_name: &str,
         body: &str,
-    ) -> Result<()> {
+        reply_to_message_id: Option<i64>,
+    ) -> Result<Vec<i64>> {
         let direction = if outgoing { ">>" } else { "<<" };
         let header: String = format!("{direction} {sender_name}:")
             .chars()
@@ -204,21 +224,27 @@ impl TelegramClient {
             .collect();
         let header = escape_html(&header);
         let body_limit = 3500usize;
+        let mut message_ids = Vec::new();
 
-        for chunk in split_text(body, body_limit) {
+        for (part_index, chunk) in split_text(body, body_limit).into_iter().enumerate() {
             let chunk = escape_html(&chunk);
             let text = format!("<b>{header}</b>\n{chunk}");
-            let sent: Message = self
-                .call(
-                    "sendMessage",
-                    &serde_json::json!({
-                        "chat_id": self.chat_id,
-                        "message_thread_id": thread_id,
-                        "text": text,
-                        "parse_mode": "HTML",
-                    }),
-                )
-                .await?;
+            let mut request = serde_json::json!({
+                "chat_id": self.chat_id,
+                "message_thread_id": thread_id,
+                "text": text,
+                "parse_mode": "HTML",
+            });
+            if part_index == 0 {
+                if let Some(reply_to_message_id) = reply_to_message_id {
+                    request["reply_parameters"] = serde_json::json!({
+                        "message_id": reply_to_message_id,
+                        "allow_sending_without_reply": true,
+                    });
+                }
+            }
+
+            let sent: Message = self.call("sendMessage", &request).await?;
 
             if sent.message_thread_id != Some(thread_id) {
                 tracing::warn!(
@@ -243,10 +269,12 @@ impl TelegramClient {
                 );
             }
 
+            message_ids.push(sent.message_id);
+
             // Keep history replay below Telegram group flood-control limits.
             tokio::time::sleep(Duration::from_millis(3200)).await;
         }
-        Ok(())
+        Ok(message_ids)
     }
 
     pub async fn send_general(&self, text: &str) -> Result<()> {
