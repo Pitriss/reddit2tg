@@ -84,9 +84,93 @@ if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
   systemctl daemon-reload >/dev/null 2>&1 || true
 fi
 
-echo "reddit2tg installed but not enabled or started."
-echo "Edit /etc/reddit2tg/config.toml, run: reddit2tg --config /etc/reddit2tg/config.toml check"
-echo "Then enable the service with either: update-rc.d reddit2tg defaults, or: systemctl enable reddit2tg.service"
+is_systemd()
+{
+  command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]
+}
+
+is_enabled()
+{
+  if is_systemd; then
+    systemctl is-enabled --quiet reddit2tg.service >/dev/null 2>&1
+  else
+    for link in /etc/rc2.d/S??reddit2tg /etc/rc3.d/S??reddit2tg /etc/rc4.d/S??reddit2tg /etc/rc5.d/S??reddit2tg; do
+      [ -L "$link" ] && return 0
+    done
+    return 1
+  fi
+}
+
+is_running()
+{
+  if is_systemd; then
+    systemctl is-active --quiet reddit2tg.service >/dev/null 2>&1
+  else
+    /etc/init.d/reddit2tg status >/dev/null 2>&1
+  fi
+}
+
+run_config_check()
+{
+  if command -v runuser >/dev/null 2>&1; then
+    if command -v timeout >/dev/null 2>&1; then
+      timeout 30s runuser -u reddit2tg -- /usr/bin/reddit2tg --config /etc/reddit2tg/config.toml check >/dev/null 2>&1
+    else
+      runuser -u reddit2tg -- /usr/bin/reddit2tg --config /etc/reddit2tg/config.toml check >/dev/null 2>&1
+    fi
+  elif command -v su >/dev/null 2>&1; then
+    if command -v timeout >/dev/null 2>&1; then
+      timeout 30s su -s /bin/sh -c 'exec /usr/bin/reddit2tg --config /etc/reddit2tg/config.toml check' reddit2tg >/dev/null 2>&1
+    else
+      su -s /bin/sh -c 'exec /usr/bin/reddit2tg --config /etc/reddit2tg/config.toml check' reddit2tg >/dev/null 2>&1
+    fi
+  else
+    return 1
+  fi
+}
+
+running=false
+enabled=false
+config_ok=false
+
+if is_running; then
+  running=true
+  config_ok=true
+elif ! cmp -s /etc/reddit2tg/config.toml /usr/share/doc/reddit2tg/examples/config.toml; then
+  if run_config_check; then
+    config_ok=true
+  fi
+fi
+
+if is_enabled; then
+  enabled=true
+fi
+
+if [ "$config_ok" != true ]; then
+  if cmp -s /etc/reddit2tg/config.toml /usr/share/doc/reddit2tg/examples/config.toml; then
+    echo "reddit2tg: edit /etc/reddit2tg/config.toml."
+  else
+    echo "reddit2tg: configuration check did not succeed."
+  fi
+  echo "reddit2tg: run: reddit2tg --config /etc/reddit2tg/config.toml check"
+fi
+
+if [ "$enabled" != true ]; then
+  if is_systemd; then
+    echo "reddit2tg: enable service: systemctl enable reddit2tg.service"
+  else
+    echo "reddit2tg: enable service: update-rc.d reddit2tg defaults"
+  fi
+fi
+
+if [ "$running" != true ]; then
+  if is_systemd; then
+    echo "reddit2tg: start service: systemctl start reddit2tg.service"
+  else
+    echo "reddit2tg: start service: service reddit2tg start"
+  fi
+fi
+
 exit 0
 EOF_POSTINST
 chmod 0755 "$DEB_ROOT/DEBIAN/postinst"
