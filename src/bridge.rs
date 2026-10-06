@@ -52,11 +52,9 @@ struct HistoryCommand {
 
 #[derive(Debug)]
 struct HistoryReplayMessage {
-    event_id: String,
+    event: MatrixEvent,
     outgoing: bool,
     sender_name: String,
-    body: String,
-    origin_server_ts: i64,
     reply_to_event_id: Option<String>,
 }
 
@@ -257,16 +255,19 @@ impl Bridge {
             if event.event_type != "m.room.message" || event.event_id.is_empty() {
                 continue;
             }
-            let Some(body) = event.content.get("body").and_then(Value::as_str) else {
-                continue;
-            };
             let msgtype = event
                 .content
                 .get("msgtype")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            if msgtype != "m.text" && msgtype != "m.notice" {
-                continue;
+            match msgtype {
+                "m.text" | "m.notice" => {
+                    if event.content.get("body").and_then(Value::as_str).is_none() {
+                        continue;
+                    }
+                }
+                "m.image" => {}
+                _ => continue,
             }
 
             let outgoing = event.sender == own_user_id;
@@ -284,13 +285,12 @@ impl Bridge {
                     fallback
                 }
             };
+            let reply_to_event_id = matrix_reply_target(&event.content);
             messages.push(HistoryReplayMessage {
-                event_id: event.event_id.clone(),
+                event,
                 outgoing,
                 sender_name,
-                body: body.to_owned(),
-                origin_server_ts: event.origin_server_ts,
-                reply_to_event_id: matrix_reply_target(&event.content),
+                reply_to_event_id,
             });
         }
 
@@ -419,7 +419,7 @@ impl Bridge {
         let mut replay_targets = HashMap::new();
         let mut replay_day: Option<String> = None;
         for message in &replay.messages {
-            let (day, time) = history_timestamp(message.origin_server_ts);
+            let (day, time) = history_timestamp(message.event.origin_server_ts);
             if replay_day.as_deref() != Some(day.as_str()) {
                 self.telegram
                     .send_history_date_separator(room.telegram_thread_id, &day)
@@ -439,25 +439,60 @@ impl Bridge {
                     None
                 };
 
-            let telegram_message_ids = self
-                .telegram
-                .send_history_message(
-                    room.telegram_thread_id,
-                    message.outgoing,
-                    &message.sender_name,
-                    &time,
-                    &message.body,
-                    reply_to_message_id,
-                )
-                .await?;
+            let msgtype = message
+                .event
+                .content
+                .get("msgtype")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let (telegram_message_ids, message_kind) = match msgtype {
+                "m.text" | "m.notice" => {
+                    let body = message
+                        .event
+                        .content
+                        .get("body")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    (
+                        self.telegram
+                            .send_history_message(
+                                room.telegram_thread_id,
+                                message.outgoing,
+                                &message.sender_name,
+                                &time,
+                                body,
+                                reply_to_message_id,
+                            )
+                            .await?,
+                        "text",
+                    )
+                }
+                "m.image" => {
+                    let direction = if message.outgoing { ">>" } else { "<<" };
+                    let caption = format!("[{time}] {direction} {}:", message.sender_name);
+                    let message_ids = self
+                        .forward_matrix_media_with_caption(
+                            room.telegram_thread_id,
+                            &message.event,
+                            reply_to_message_id,
+                            Some(&caption),
+                        )
+                        .await?;
+                    sleep(Duration::from_millis(3200)).await;
+                    (message_ids, "image")
+                }
+                _ => continue,
+            };
+
             if let Some(message_id) = telegram_message_ids.first().copied() {
-                replay_targets.insert(message.event_id.clone(), message_id);
+                replay_targets.insert(message.event.event_id.clone(), message_id);
             }
-            self.db.record_matrix_delivery(
+            self.db.record_matrix_delivery_kind(
                 &room.matrix_room_id,
-                &message.event_id,
+                &message.event.event_id,
                 room.telegram_thread_id,
                 &telegram_message_ids,
+                message_kind,
             )?;
         }
         info!(
@@ -517,7 +552,7 @@ impl Bridge {
         let mut deliveries = Vec::new();
         let mut replay_day: Option<String> = None;
         for message in &replay.messages {
-            let (day, time) = history_timestamp(message.origin_server_ts);
+            let (day, time) = history_timestamp(message.event.origin_server_ts);
             if replay_day.as_deref() != Some(day.as_str()) {
                 if let Err(error) = self
                     .telegram
@@ -537,19 +572,54 @@ impl Bridge {
                 .as_deref()
                 .and_then(|event_id| replay_targets.get(event_id).copied());
 
-            let telegram_message_ids = match self
-                .telegram
-                .send_history_message(
-                    new_thread_id,
-                    message.outgoing,
-                    &message.sender_name,
-                    &time,
-                    &message.body,
-                    reply_to_message_id,
-                )
-                .await
-            {
-                Ok(message_ids) => message_ids,
+            let msgtype = message
+                .event
+                .content
+                .get("msgtype")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let replay_result = match msgtype {
+                "m.text" | "m.notice" => {
+                    let body = message
+                        .event
+                        .content
+                        .get("body")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    self.telegram
+                        .send_history_message(
+                            new_thread_id,
+                            message.outgoing,
+                            &message.sender_name,
+                            &time,
+                            body,
+                            reply_to_message_id,
+                        )
+                        .await
+                        .map(|ids| (ids, "text"))
+                }
+                "m.image" => {
+                    let direction = if message.outgoing { ">>" } else { "<<" };
+                    let caption = format!("[{time}] {direction} {}:", message.sender_name);
+                    let result = self
+                        .forward_matrix_media_with_caption(
+                            new_thread_id,
+                            &message.event,
+                            reply_to_message_id,
+                            Some(&caption),
+                        )
+                        .await
+                        .map(|ids| (ids, "image"));
+                    if result.is_ok() {
+                        sleep(Duration::from_millis(3200)).await;
+                    }
+                    result
+                }
+                _ => continue,
+            };
+
+            let (telegram_message_ids, message_kind) = match replay_result {
+                Ok(result) => result,
                 Err(error) => {
                     self.close_incomplete_reset_topic(new_thread_id, &replay.title)
                         .await;
@@ -558,10 +628,15 @@ impl Bridge {
             };
 
             if let Some(message_id) = telegram_message_ids.first().copied() {
-                replay_targets.insert(message.event_id.clone(), message_id);
+                replay_targets.insert(message.event.event_id.clone(), message_id);
             }
             for (part_index, message_id) in telegram_message_ids.into_iter().enumerate() {
-                deliveries.push((message.event_id.clone(), message_id, part_index as i64));
+                deliveries.push((
+                    message.event.event_id.clone(),
+                    message_id,
+                    part_index as i64,
+                    message_kind.to_owned(),
+                ));
             }
         }
 
@@ -989,6 +1064,17 @@ impl Bridge {
         event: &MatrixEvent,
         reply_to_message_id: Option<i64>,
     ) -> Result<Vec<i64>> {
+        self.forward_matrix_media_with_caption(thread_id, event, reply_to_message_id, None)
+            .await
+    }
+
+    async fn forward_matrix_media_with_caption(
+        &self,
+        thread_id: i64,
+        event: &MatrixEvent,
+        reply_to_message_id: Option<i64>,
+        caption_prefix: Option<&str>,
+    ) -> Result<Vec<i64>> {
         let body = event
             .content
             .get("body")
@@ -1072,8 +1158,16 @@ impl Bridge {
             mime_type
         };
         let file_name = media_file_name(body, mime_type, msgtype);
-        let caption =
+        let event_caption =
             (!body.trim().is_empty() && body != "Image" && body != file_name).then_some(body);
+        let prefixed_caption = caption_prefix.map(|prefix| match event_caption {
+            Some(event_caption) => format!(
+                "{prefix}
+{event_caption}"
+            ),
+            None => prefix.to_owned(),
+        });
+        let caption = prefixed_caption.as_deref().or(event_caption);
 
         let message_id = self
             .telegram

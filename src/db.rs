@@ -320,16 +320,6 @@ impl Db {
         Ok(())
     }
 
-    pub fn record_matrix_delivery(
-        &self,
-        room_id: &str,
-        event_id: &str,
-        thread_id: i64,
-        telegram_message_ids: &[i64],
-    ) -> Result<()> {
-        self.record_matrix_delivery_kind(room_id, event_id, thread_id, telegram_message_ids, "text")
-    }
-
     pub fn record_matrix_delivery_kind(
         &self,
         room_id: &str,
@@ -451,7 +441,7 @@ impl Db {
         thread_id: i64,
         title: &str,
         status: &str,
-        deliveries: &[(String, i64, i64)],
+        deliveries: &[(String, i64, i64, String)],
     ) -> Result<()> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
@@ -465,7 +455,7 @@ impl Db {
                  updated_at = excluded.updated_at"#,
             params![room_id, thread_id, title, status, now_unix()],
         )?;
-        for (event_id, message_id, part_index) in deliveries {
+        for (event_id, message_id, part_index, message_kind) in deliveries {
             tx.execute(
                 "INSERT OR IGNORE INTO seen_matrix_events(event_id, matrix_room_id, created_at) VALUES(?1, ?2, ?3)",
                 params![event_id, room_id, now_unix()],
@@ -478,7 +468,7 @@ impl Db {
                     thread_id,
                     message_id: *message_id,
                     direction: "matrix_to_telegram",
-                    message_kind: "text",
+                    message_kind,
                     part_index: *part_index,
                 },
             )?;

@@ -33,7 +33,7 @@ The target deployment is Linux/Devuan without Rust, Cargo, a system OpenSSL inst
 - long-running administrative commands acknowledge the Telegram update before replay so a transient failure cannot execute the same `/reset-chat` repeatedly
 - replayed Matrix event IDs are persisted for deduplication so normal `/sync` processing does not forward the same history again
 
-The default history limit is 50 text/notice messages and the accepted maximum is 200. `dry-run` reports what would be processed without changing Telegram topics or SQLite mappings.
+The default history limit is 50 replayable text/notice/image events and the accepted maximum is 2000. `dry-run` reports what would be processed without changing Telegram topics or SQLite mappings.
 
 ### Authentication and recovery
 
@@ -68,7 +68,7 @@ Not implemented yet: reactions, edits/deletes, typing indicators, starting a bra
 
 Reddit's upload endpoint accepts images only (JPEG/PNG/WebP up to 20 MiB, GIF up to 100 MiB). The standard Telegram Bot API can download incoming user files only up to 20 MiB and upload at most 10 MiB as a photo or 50 MiB as another file, so larger media cannot be bridged through the hosted Bot API.
 
-History recovery still replays text/notice events only; live media bridging is implemented, but `/reload-history` and `/reset-chat` do not yet replay historical media.
+History recovery replays text/notice and image events. Historical images use the same Matrix media download and Telegram upload path as live Reddit images, while preserving chronological ordering and reply targets.
 
 ## Configuration values
 
@@ -366,7 +366,7 @@ The same operation is available from the configured Telegram operator account. S
 
 ### Reload or reset a mapped chat from Reddit history
 
-For a joined Reddit chat, the configured Telegram operator can replay recent Reddit/Matrix history directly from inside that chat's mapped Telegram topic. The default is 50 messages and the accepted range is 1-200:
+For a joined Reddit chat, the configured Telegram operator can replay recent Reddit/Matrix history directly from inside that chat's mapped Telegram topic. The default is 50 replayable events and the accepted range is 1-2000:
 
 ```text
 /reload-history
@@ -375,9 +375,9 @@ For a joined Reddit chat, the configured Telegram operator can replay recent Red
 /reload-history 100 dry-run
 ```
 
-`/reload-history` fetches recent `m.room.message` history through Matrix `/rooms/{roomId}/messages`, renders it chronologically with the resolved Reddit sender names, and appends it to the current Telegram topic. It does not change the global Matrix `/sync` checkpoint and does not send read receipts for replayed history. Replayed event IDs are added to the normal dedup table only after Telegram delivery succeeds.
+`/reload-history` fetches recent replayable `m.room.message` history through Matrix `/rooms/{roomId}/messages`, including text/notice and image events, renders it chronologically with the resolved Reddit sender names, and appends it to the current Telegram topic. It does not change the global Matrix `/sync` checkpoint and does not send read receipts for replayed history. Replayed event IDs are added to the normal dedup table only after Telegram delivery succeeds.
 
-Each replayed Matrix event is sent as its own Telegram message. The compact bold header is `>> <name>:` for messages sent by the bridged Reddit account and `<< <name>:` for messages received from the other side; the message body stays normal text.
+Each replayed Matrix event is sent as its own Telegram message. Text/notice events use the compact bold header `>> <name>:` for messages sent by the bridged Reddit account and `<< <name>:` for messages received from the other side. Historical images are uploaded as Telegram media with `[HH:MM:SS] >>/<< <name>:` in the caption and retain the Matrix `m.in_reply_to` target when it can be mapped.
 
 For a damaged or badly reconstructed Telegram topic, use the stronger reset operation:
 

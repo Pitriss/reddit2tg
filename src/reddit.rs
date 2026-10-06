@@ -1101,8 +1101,8 @@ impl RedditClient {
         let mut collected = Vec::new();
 
         // Matrix is allowed to return fewer events than requested. Follow the
-        // `end` token until we have the requested number of usable text/notice
-        // messages (or the server has no older history left).
+        // `end` token until we have the requested number of replayable
+        // text/notice/image events (or the server has no older history left).
         for _ in 0..50 {
             if collected.len() >= target {
                 break;
@@ -1167,7 +1167,7 @@ impl RedditClient {
                     .get("msgtype")
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                if msgtype != "m.text" && msgtype != "m.notice" {
+                if msgtype != "m.text" && msgtype != "m.notice" && msgtype != "m.image" {
                     continue;
                 }
                 collected.push(event);
