@@ -34,7 +34,7 @@ pub struct Bridge {
 }
 
 const DEFAULT_HISTORY_LIMIT: usize = 50;
-const MAX_HISTORY_LIMIT: usize = 200;
+const MAX_HISTORY_LIMIT: usize = 2000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HistoryCommandKind {
@@ -1387,6 +1387,32 @@ impl Bridge {
             return Ok(());
         };
 
+        if let Some(valid) = parse_help_command(text) {
+            let general =
+                message.message_thread_id.is_none() || message.message_thread_id == Some(1);
+            if !valid {
+                if general {
+                    self.telegram.send_general("Použití: /help").await?;
+                } else if let Some(thread_id) = message.message_thread_id {
+                    self.telegram.send_text(thread_id, "Použití: /help").await?;
+                }
+                return Ok(());
+            }
+
+            if general {
+                self.telegram.send_general(general_help_text()).await?;
+            } else if let Some(thread_id) = message.message_thread_id {
+                let room = self.db.room_by_thread(thread_id)?;
+                self.telegram
+                    .send_text(
+                        thread_id,
+                        topic_help_text(room.as_ref().map(|room| room.status.as_str())),
+                    )
+                    .await?;
+            }
+            return Ok(());
+        }
+
         if let Some(command) = parse_reconcile_names_command(text) {
             match command {
                 Ok(dry_run) => {
@@ -1406,7 +1432,7 @@ impl Bridge {
             let command = match command {
                 Ok(command) => command,
                 Err(()) => {
-                    let usage = "Použití: /reload-history [1-200] [dry-run] nebo /reset-chat [1-200] [dry-run]";
+                    let usage = "Použití: /reload-history [1-2000] [dry-run] nebo /reset-chat [1-2000] [dry-run]";
                     if let Some(thread_id) = message.message_thread_id {
                         self.telegram.send_text(thread_id, usage).await?;
                     } else {
@@ -1598,6 +1624,63 @@ fn reconciled_title(status: &str, name: &str) -> String {
         format!("REQUEST · {name}")
     } else {
         name
+    }
+}
+
+fn parse_help_command(input: &str) -> Option<bool> {
+    let mut parts = input.split_whitespace();
+    let first = parts.next()?;
+    let command = first.split('@').next().unwrap_or(first);
+    if command != "/help" {
+        return None;
+    }
+    Some(parts.next().is_none())
+}
+
+fn general_help_text() -> &'static str {
+    "reddit2tg — General\n\
+/help — zobrazí tuto nápovědu\n\
+/reconcile-names [dry-run] — sjednotí názvy Telegram topiců s Reddit profily\n\
+\n\
+Příkazy pro konkrétní Reddit chat jsou dostupné uvnitř jeho topicu."
+}
+
+fn topic_help_text(status: Option<&str>) -> &'static str {
+    match status {
+        Some("invite") => {
+            "reddit2tg — Reddit message request\n\
+/help — zobrazí tuto nápovědu\n\
+/accept — přijme Reddit message request\n\
+/decline — odmítne Reddit message request"
+        }
+        Some("joined") => {
+            "reddit2tg — Reddit chat\n\
+/help — zobrazí tuto nápovědu\n\
+/reload-history [1-2000] [dry-run] — znovu nahraje historii do tohoto topicu\n\
+/reset-chat [1-2000] [dry-run] — vytvoří nový topic a přehraje do něj historii\n\
+\n\
+Běžný text se odešle na Reddit.\n\
+Podporované obrázky: JPEG, PNG, GIF a WebP.\n\
+Odpověď na zprávu se zachová jako Reddit reply/thread."
+        }
+        Some("declined") => {
+            "reddit2tg — odmítnutý Reddit request\n\
+/help — zobrazí tuto nápovědu\n\
+\n\
+Tento request byl odmítnut; další chatové příkazy nejsou k dispozici."
+        }
+        Some(_) => {
+            "reddit2tg — Reddit chat\n\
+/help — zobrazí tuto nápovědu\n\
+\n\
+Pro aktuální stav tohoto chatu nejsou dostupné další příkazy."
+        }
+        None => {
+            "reddit2tg — nemapovaný topic\n\
+/help — zobrazí tuto nápovědu\n\
+\n\
+Tento Telegram topic není mapovaný na Reddit chat."
+        }
     }
 }
 
@@ -1827,12 +1910,39 @@ fn unix_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        fallback_topic_color, matrix_reply_target, parse_history_command,
-        parse_reconcile_names_command, startup_event_should_forward, topic_color_from_avatar,
-        HistoryCommand, HistoryCommandKind, DEFAULT_HISTORY_LIMIT,
+        fallback_topic_color, general_help_text, matrix_reply_target, parse_help_command,
+        parse_history_command, parse_reconcile_names_command, startup_event_should_forward,
+        topic_color_from_avatar, topic_help_text, HistoryCommand, HistoryCommandKind,
+        DEFAULT_HISTORY_LIMIT,
     };
     use crate::telegram::TELEGRAM_TOPIC_COLORS;
     use image::{Rgba, RgbaImage};
+
+    #[test]
+    fn help_command_accepts_plain_and_bot_suffix_forms() {
+        assert_eq!(parse_help_command("/help"), Some(true));
+        assert_eq!(parse_help_command("/help@reddit2tg_bot"), Some(true));
+        assert_eq!(parse_help_command("/help extra"), Some(false));
+        assert_eq!(parse_help_command("hello"), None);
+    }
+
+    #[test]
+    fn help_text_is_context_specific_and_uses_current_history_limit() {
+        assert!(general_help_text().contains("/reconcile-names"));
+        assert!(!general_help_text().contains("/reset-chat"));
+
+        let invite = topic_help_text(Some("invite"));
+        assert!(invite.contains("/accept"));
+        assert!(invite.contains("/decline"));
+        assert!(!invite.contains("/reset-chat"));
+
+        let joined = topic_help_text(Some("joined"));
+        assert!(joined.contains("/reload-history [1-2000]"));
+        assert!(joined.contains("/reset-chat [1-2000]"));
+        assert!(!joined.contains("/accept"));
+
+        assert!(topic_help_text(None).contains("není mapovaný"));
+    }
 
     #[test]
     fn avatar_color_maps_exact_palette_colors() {
@@ -1952,7 +2062,7 @@ mod tests {
     #[test]
     fn history_commands_reject_invalid_limits_and_extra_arguments() {
         assert_eq!(parse_history_command("/reload-history 0"), Some(Err(())));
-        assert_eq!(parse_history_command("/reset-chat 201"), Some(Err(())));
+        assert_eq!(parse_history_command("/reset-chat 2001"), Some(Err(())));
         assert_eq!(
             parse_history_command("/reload-history 10 20"),
             Some(Err(()))
