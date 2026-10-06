@@ -1243,8 +1243,8 @@ impl Bridge {
                     &room.matrix_room_id,
                     caption,
                     &format!("tg-{update_id}-{}-caption", message.message_id),
-                    None,
-                    None,
+                    thread_root_event_id.as_deref(),
+                    Some(event_id.as_str()),
                     self.cfg.bridge.refresh_before_secs,
                 )
                 .await?;
