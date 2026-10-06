@@ -125,6 +125,14 @@ struct GetUpdatesBody {
 pub const TELEGRAM_DOWNLOAD_LIMIT: u64 = 20 << 20;
 pub const TELEGRAM_PHOTO_UPLOAD_LIMIT: usize = 10 << 20;
 pub const TELEGRAM_FILE_UPLOAD_LIMIT: usize = 50 << 20;
+pub const TELEGRAM_TOPIC_COLORS: [u32; 6] = [
+    0x6FB9F0, // blue
+    0xFFD67E, // yellow
+    0xCB86DB, // purple
+    0x8EEE98, // green
+    0xFF93B2, // pink
+    0xFB6F5F, // red
+];
 
 impl Message {
     pub fn image_attachment(&self) -> Option<TelegramImageAttachment> {
@@ -259,17 +267,16 @@ impl TelegramClient {
         Ok(me)
     }
 
-    pub async fn create_topic(&self, title: &str) -> Result<i64> {
+    pub async fn create_topic(&self, title: &str, icon_color: Option<u32>) -> Result<i64> {
         let title = sanitize_topic_title(title);
-        let topic: ForumTopic = self
-            .call(
-                "createForumTopic",
-                &serde_json::json!({
-                    "chat_id": self.chat_id,
-                    "name": title,
-                }),
-            )
-            .await?;
+        let mut body = serde_json::json!({
+            "chat_id": self.chat_id,
+            "name": title,
+        });
+        if let Some(icon_color) = icon_color {
+            body["icon_color"] = serde_json::json!(icon_color);
+        }
+        let topic: ForumTopic = self.call("createForumTopic", &body).await?;
         Ok(topic.message_thread_id)
     }
 

@@ -167,6 +167,7 @@ struct MessagesResponse {
 pub const REDDIT_MAX_UPLOAD_SIZE: usize = 20 << 20;
 pub const REDDIT_MAX_GIF_UPLOAD_SIZE: usize = 100 << 20;
 const REDDIT_MAX_MEDIA_DOWNLOAD_SIZE: usize = 110 << 20;
+const REDDIT_MAX_AVATAR_DOWNLOAD_SIZE: usize = 16 << 20;
 
 pub fn reddit_upload_limit(mime_type: &str) -> Option<usize> {
     match mime_type {
@@ -597,6 +598,92 @@ impl RedditClient {
             return Ok((data.to_vec(), mime_type));
         }
         unreachable!()
+    }
+
+    pub async fn download_user_avatar(&self, username: &str) -> Result<Option<Vec<u8>>> {
+        let username = username.trim().trim_start_matches("u/");
+        if username.is_empty() {
+            return Ok(None);
+        }
+
+        let about_url = format!(
+            "{REDDIT_BASE_URL}/user/{}/about.json",
+            urlencoding::encode(username)
+        );
+        let response = self
+            .reddit_http
+            .get(about_url)
+            .timeout(Duration::from_secs(10))
+            .header("Cookie", &self.cookie_header)
+            .header("Accept", "application/json,*/*")
+            .header("Referer", REDDIT_BASE_URL)
+            .send()
+            .await
+            .context("Reddit user profile request failed")?;
+
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            bail!(
+                "Reddit user profile failed: HTTP {status}: {}",
+                truncate(&body, 300)
+            );
+        }
+
+        let value: Value = response
+            .json()
+            .await
+            .context("Reddit user profile returned invalid JSON")?;
+        let avatar_url = value
+            .pointer("/data/icon_img")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                value
+                    .pointer("/data/snoovatar_img")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+            });
+        let Some(avatar_url) = avatar_url else {
+            return Ok(None);
+        };
+        let avatar_url = avatar_url.replace("&amp;", "&");
+
+        let response = self
+            .reddit_http
+            .get(&avatar_url)
+            .timeout(Duration::from_secs(10))
+            .header("Accept", "image/*,*/*")
+            .header("Referer", REDDIT_BASE_URL)
+            .send()
+            .await
+            .context("Reddit avatar download request failed")?;
+        let response = response
+            .error_for_status()
+            .context("Reddit avatar download failed")?;
+        if response
+            .content_length()
+            .is_some_and(|size| size > REDDIT_MAX_AVATAR_DOWNLOAD_SIZE as u64)
+        {
+            bail!(
+                "Reddit avatar exceeds download limit of {} bytes",
+                REDDIT_MAX_AVATAR_DOWNLOAD_SIZE
+            );
+        }
+        let data = response
+            .bytes()
+            .await
+            .context("Reddit avatar download body failed")?;
+        if data.len() > REDDIT_MAX_AVATAR_DOWNLOAD_SIZE {
+            bail!(
+                "Reddit avatar exceeds download limit of {} bytes",
+                REDDIT_MAX_AVATAR_DOWNLOAD_SIZE
+            );
+        }
+        Ok(Some(data.to_vec()))
     }
 
     pub async fn upload_media(

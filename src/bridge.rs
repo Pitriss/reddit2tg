@@ -1,10 +1,12 @@
 use std::{
     collections::{HashMap, HashSet},
+    io::Cursor,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
+use image::{DynamicImage, ImageFormat, ImageReader, Limits, RgbaImage};
 use serde_json::Value;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
@@ -16,7 +18,10 @@ use crate::{
         detect_supported_image_mime, is_auth_refresh_error, matrix_localpart, member_display_name,
         reddit_upload_limit, InvitedRoom, JoinedRoom, MatrixEvent, RedditClient, SendImageRequest,
     },
-    telegram::{Message, TelegramClient, TELEGRAM_DOWNLOAD_LIMIT, TELEGRAM_FILE_UPLOAD_LIMIT},
+    telegram::{
+        Message, TelegramClient, TELEGRAM_DOWNLOAD_LIMIT, TELEGRAM_FILE_UPLOAD_LIMIT,
+        TELEGRAM_TOPIC_COLORS,
+    },
 };
 
 #[derive(Clone)]
@@ -56,7 +61,14 @@ struct HistoryReplayMessage {
 #[derive(Debug)]
 struct HistoryReplay {
     title: String,
+    profile_name: Option<String>,
     messages: Vec<HistoryReplayMessage>,
+}
+
+#[derive(Debug)]
+struct ProfileVisual {
+    png: Vec<u8>,
+    icon_color: u32,
 }
 
 impl Bridge {
@@ -279,7 +291,105 @@ impl Bridge {
             });
         }
 
-        Ok(HistoryReplay { title, messages })
+        let profile_name = counterpart.as_ref().map(|(_, name)| name.clone());
+        Ok(HistoryReplay {
+            title,
+            profile_name,
+            messages,
+        })
+    }
+
+    async fn load_profile_visual(&self, profile_name: Option<&str>) -> Option<ProfileVisual> {
+        let profile_name = profile_name?;
+        let username = normalize_reddit_username(profile_name)?;
+        let data = match self.reddit.download_user_avatar(&username).await {
+            Ok(Some(data)) => data,
+            Ok(None) => return None,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    reddit_username = %username,
+                    "Reddit avatar could not be downloaded"
+                );
+                return None;
+            }
+        };
+        match prepare_profile_visual(&data) {
+            Ok(visual) => Some(visual),
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    reddit_username = %username,
+                    "Reddit avatar could not be decoded"
+                );
+                None
+            }
+        }
+    }
+
+    async fn send_profile_intro(
+        &self,
+        thread_id: i64,
+        profile_name: Option<&str>,
+        visual: Option<&ProfileVisual>,
+    ) {
+        let Some(profile_name) = profile_name
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return;
+        };
+        let username = normalize_reddit_username(profile_name);
+        let intro = username
+            .as_deref()
+            .map(|username| format!("Reddit · u/{username}"))
+            .unwrap_or_else(|| format!("Reddit · {profile_name}"));
+
+        if let Some(visual) = visual {
+            if let Err(error) = self
+                .telegram
+                .send_media_with_reply(
+                    thread_id,
+                    &visual.png,
+                    "reddit-avatar.png",
+                    "image/png",
+                    Some(&intro),
+                    None,
+                )
+                .await
+            {
+                warn!(
+                    error = %error,
+                    telegram_thread_id = thread_id,
+                    "Reddit profile avatar could not be sent; falling back to text intro"
+                );
+                if let Err(fallback_error) = self.telegram.send_text(thread_id, &intro).await {
+                    warn!(
+                        error = %fallback_error,
+                        telegram_thread_id = thread_id,
+                        "Reddit text profile intro could not be sent"
+                    );
+                }
+            }
+        } else if let Err(error) = self.telegram.send_text(thread_id, &intro).await {
+            warn!(
+                error = %error,
+                telegram_thread_id = thread_id,
+                "Reddit text profile intro could not be sent"
+            );
+        }
+    }
+
+    async fn create_profile_topic(&self, title: &str, profile_name: Option<&str>) -> Result<i64> {
+        let visual = self.load_profile_visual(profile_name).await;
+        let icon_color = visual
+            .as_ref()
+            .map(|visual| visual.icon_color)
+            .unwrap_or_else(|| fallback_topic_color(profile_name.unwrap_or(title)));
+        let thread_id = self.telegram.create_topic(title, Some(icon_color)).await?;
+        self.send_profile_intro(thread_id, profile_name, visual.as_ref())
+            .await;
+        Ok(thread_id)
     }
 
     async fn reload_history(
@@ -387,7 +497,9 @@ impl Bridge {
             return Ok((room.telegram_thread_id, report));
         }
 
-        let new_thread_id = self.telegram.create_topic(&replay.title).await?;
+        let new_thread_id = self
+            .create_profile_topic(&replay.title, replay.profile_name.as_deref())
+            .await?;
         let mut replay_targets = HashMap::new();
         let mut deliveries = Vec::new();
         for message in &replay.messages {
@@ -668,7 +780,7 @@ impl Bridge {
             member_display_name(room.invite_state.events.clone().into_iter(), &own)
                 .unwrap_or_else(|| ("unknown".to_owned(), "Unknown Reddit user".to_owned()));
         let title = format!("REQUEST · {}", clean_name(&name));
-        let thread_id = self.telegram.create_topic(&title).await?;
+        let thread_id = self.create_profile_topic(&title, Some(&name)).await?;
         info!(matrix_room_id = %room_id, telegram_thread_id = thread_id, title = %title, status = "invite", "Telegram topic created for Reddit room");
         self.db.upsert_room(room_id, thread_id, &title, "invite")?;
         self.telegram.send_text(
@@ -1050,7 +1162,7 @@ impl Bridge {
             return Ok(mapping);
         }
         let title = clean_name(title_hint.unwrap_or("Reddit chat"));
-        let thread_id = self.telegram.create_topic(&title).await?;
+        let thread_id = self.create_profile_topic(&title, title_hint).await?;
         info!(matrix_room_id = %room_id, telegram_thread_id = thread_id, title = %title, status = %status, "Telegram topic created for Reddit room");
         self.db.upsert_room(room_id, thread_id, &title, status)?;
         self.db
@@ -1541,6 +1653,102 @@ fn parse_history_command(input: &str) -> Option<std::result::Result<HistoryComma
     }))
 }
 
+fn normalize_reddit_username(value: &str) -> Option<String> {
+    let value = value.trim().strip_prefix("u/").unwrap_or(value.trim());
+    if value.is_empty()
+        || value.len() > 32
+        || value.starts_with("t2_")
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        return None;
+    }
+    Some(value.to_owned())
+}
+
+fn fallback_topic_color(seed: &str) -> u32 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in seed.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    TELEGRAM_TOPIC_COLORS[(hash as usize) % TELEGRAM_TOPIC_COLORS.len()]
+}
+
+fn prepare_profile_visual(data: &[u8]) -> Result<ProfileVisual> {
+    let mut reader = ImageReader::new(Cursor::new(data))
+        .with_guessed_format()
+        .context("guess Reddit avatar image format")?;
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(4096);
+    limits.max_image_height = Some(4096);
+    limits.max_alloc = Some(64 << 20);
+    reader.limits(limits);
+    let decoded = reader.decode().context("decode Reddit avatar image")?;
+    let thumbnail = decoded.thumbnail(320, 320).to_rgba8();
+    let icon_color = topic_color_from_avatar(&thumbnail);
+
+    let mut png = Vec::new();
+    DynamicImage::ImageRgba8(thumbnail)
+        .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+        .context("encode Reddit avatar as PNG")?;
+
+    Ok(ProfileVisual { png, icon_color })
+}
+
+fn topic_color_from_avatar(image: &RgbaImage) -> u32 {
+    let mut scores = [0u64; TELEGRAM_TOPIC_COLORS.len()];
+    let mut total_weight = 0u64;
+
+    for pixel in image.pixels() {
+        let [r, g, b, a] = pixel.0;
+        if a < 64 {
+            continue;
+        }
+
+        let max = r.max(g).max(b);
+        let min = r.min(g).min(b);
+        if max <= 8 || min >= 248 {
+            continue;
+        }
+
+        let saturation = u64::from(max - min);
+        let weight = (saturation + 24) * u64::from(a);
+
+        let mut nearest = 0usize;
+        let mut nearest_distance = u64::MAX;
+        for (index, color) in TELEGRAM_TOPIC_COLORS.iter().copied().enumerate() {
+            let cr = ((color >> 16) & 0xff) as i32;
+            let cg = ((color >> 8) & 0xff) as i32;
+            let cb = (color & 0xff) as i32;
+            let dr = i32::from(r) - cr;
+            let dg = i32::from(g) - cg;
+            let db = i32::from(b) - cb;
+            let distance = (dr * dr + dg * dg + db * db) as u64;
+            if distance < nearest_distance {
+                nearest_distance = distance;
+                nearest = index;
+            }
+        }
+
+        scores[nearest] = scores[nearest].saturating_add(weight);
+        total_weight = total_weight.saturating_add(weight);
+    }
+
+    if total_weight == 0 {
+        return TELEGRAM_TOPIC_COLORS[0];
+    }
+
+    let index = scores
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, score)| **score)
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    TELEGRAM_TOPIC_COLORS[index]
+}
+
 fn normalize_mime(value: &str) -> &str {
     value.split(';').next().unwrap_or(value).trim()
 }
@@ -1619,9 +1827,46 @@ fn unix_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        matrix_reply_target, parse_history_command, parse_reconcile_names_command,
-        startup_event_should_forward, HistoryCommand, HistoryCommandKind, DEFAULT_HISTORY_LIMIT,
+        fallback_topic_color, matrix_reply_target, parse_history_command,
+        parse_reconcile_names_command, startup_event_should_forward, topic_color_from_avatar,
+        HistoryCommand, HistoryCommandKind, DEFAULT_HISTORY_LIMIT,
     };
+    use crate::telegram::TELEGRAM_TOPIC_COLORS;
+    use image::{Rgba, RgbaImage};
+
+    #[test]
+    fn avatar_color_maps_exact_palette_colors() {
+        for color in TELEGRAM_TOPIC_COLORS {
+            let pixel = Rgba([
+                ((color >> 16) & 0xff) as u8,
+                ((color >> 8) & 0xff) as u8,
+                (color & 0xff) as u8,
+                255,
+            ]);
+            let image = RgbaImage::from_pixel(8, 8, pixel);
+            assert_eq!(topic_color_from_avatar(&image), color);
+        }
+    }
+
+    #[test]
+    fn transparent_or_white_avatar_falls_back_to_blue() {
+        let transparent = RgbaImage::from_pixel(8, 8, Rgba([255, 0, 0, 0]));
+        assert_eq!(
+            topic_color_from_avatar(&transparent),
+            TELEGRAM_TOPIC_COLORS[0]
+        );
+
+        let white = RgbaImage::from_pixel(8, 8, Rgba([255, 255, 255, 255]));
+        assert_eq!(topic_color_from_avatar(&white), TELEGRAM_TOPIC_COLORS[0]);
+    }
+
+    #[test]
+    fn username_fallback_topic_color_is_stable() {
+        assert_eq!(
+            fallback_topic_color("some_redditor"),
+            fallback_topic_color("some_redditor")
+        );
+    }
 
     #[test]
     fn extracts_matrix_reply_target() {
