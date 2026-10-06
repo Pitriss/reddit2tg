@@ -1091,7 +1091,7 @@ impl RedditClient {
         limit: usize,
         refresh_before_secs: u64,
     ) -> Result<Vec<MatrixEvent>> {
-        let target = limit.clamp(1, 200);
+        let target = limit.clamp(1, 2000);
         let room = urlencoding::encode(room_id);
         let url = format!(
             "{}/_matrix/client/v3/rooms/{room}/messages",

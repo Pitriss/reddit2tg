@@ -350,16 +350,36 @@ impl TelegramClient {
         Ok(message_ids)
     }
 
+    pub async fn send_history_date_separator(&self, thread_id: i64, date: &str) -> Result<()> {
+        let text = format!("──── {} ────", escape_html(date));
+        let _: Message = self
+            .call(
+                "sendMessage",
+                &serde_json::json!({
+                    "chat_id": self.chat_id,
+                    "message_thread_id": thread_id,
+                    "text": text,
+                    "parse_mode": "HTML",
+                }),
+            )
+            .await?;
+
+        // Date separators are replay messages too and count against Telegram flood control.
+        tokio::time::sleep(Duration::from_millis(3200)).await;
+        Ok(())
+    }
+
     pub async fn send_history_message(
         &self,
         thread_id: i64,
         outgoing: bool,
         sender_name: &str,
+        time: &str,
         body: &str,
         reply_to_message_id: Option<i64>,
     ) -> Result<Vec<i64>> {
         let direction = if outgoing { ">>" } else { "<<" };
-        let header: String = format!("{direction} {sender_name}:")
+        let header: String = format!("[{time}] {direction} {sender_name}:")
             .chars()
             .take(200)
             .collect();

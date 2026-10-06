@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Local, Utc};
 use image::{DynamicImage, ImageFormat, ImageReader, Limits, RgbaImage};
 use serde_json::Value;
 use tokio::time::sleep;
@@ -55,6 +56,7 @@ struct HistoryReplayMessage {
     outgoing: bool,
     sender_name: String,
     body: String,
+    origin_server_ts: i64,
     reply_to_event_id: Option<String>,
 }
 
@@ -287,6 +289,7 @@ impl Bridge {
                 outgoing,
                 sender_name,
                 body: body.to_owned(),
+                origin_server_ts: event.origin_server_ts,
                 reply_to_event_id: matrix_reply_target(&event.content),
             });
         }
@@ -414,7 +417,16 @@ impl Bridge {
         }
 
         let mut replay_targets = HashMap::new();
+        let mut replay_day: Option<String> = None;
         for message in &replay.messages {
+            let (day, time) = history_timestamp(message.origin_server_ts);
+            if replay_day.as_deref() != Some(day.as_str()) {
+                self.telegram
+                    .send_history_date_separator(room.telegram_thread_id, &day)
+                    .await?;
+                replay_day = Some(day);
+            }
+
             let reply_to_message_id =
                 if let Some(reply_event_id) = message.reply_to_event_id.as_deref() {
                     if let Some(message_id) = replay_targets.get(reply_event_id).copied() {
@@ -433,6 +445,7 @@ impl Bridge {
                     room.telegram_thread_id,
                     message.outgoing,
                     &message.sender_name,
+                    &time,
                     &message.body,
                     reply_to_message_id,
                 )
@@ -502,7 +515,23 @@ impl Bridge {
             .await?;
         let mut replay_targets = HashMap::new();
         let mut deliveries = Vec::new();
+        let mut replay_day: Option<String> = None;
         for message in &replay.messages {
+            let (day, time) = history_timestamp(message.origin_server_ts);
+            if replay_day.as_deref() != Some(day.as_str()) {
+                if let Err(error) = self
+                    .telegram
+                    .send_history_date_separator(new_thread_id, &day)
+                    .await
+                {
+                    self.close_incomplete_reset_topic(new_thread_id, &replay.title)
+                        .await;
+                    return Err(error)
+                        .context("send history date separator into new Telegram topic");
+                }
+                replay_day = Some(day);
+            }
+
             let reply_to_message_id = message
                 .reply_to_event_id
                 .as_deref()
@@ -514,6 +543,7 @@ impl Bridge {
                     new_thread_id,
                     message.outgoing,
                     &message.sender_name,
+                    &time,
                     &message.body,
                     reply_to_message_id,
                 )
@@ -1832,6 +1862,17 @@ fn topic_color_from_avatar(image: &RgbaImage) -> u32 {
     TELEGRAM_TOPIC_COLORS[index]
 }
 
+fn history_timestamp(origin_server_ts: i64) -> (String, String) {
+    let utc = DateTime::<Utc>::from_timestamp_millis(origin_server_ts).unwrap_or_else(|| {
+        DateTime::<Utc>::from_timestamp(0, 0).expect("Unix epoch must be valid")
+    });
+    let local = utc.with_timezone(&Local);
+    (
+        local.format("%-d. %-m. %Y").to_string(),
+        local.format("%H:%M:%S").to_string(),
+    )
+}
+
 fn normalize_mime(value: &str) -> &str {
     value.split(';').next().unwrap_or(value).trim()
 }
@@ -1910,10 +1951,10 @@ fn unix_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        fallback_topic_color, general_help_text, matrix_reply_target, parse_help_command,
-        parse_history_command, parse_reconcile_names_command, startup_event_should_forward,
-        topic_color_from_avatar, topic_help_text, HistoryCommand, HistoryCommandKind,
-        DEFAULT_HISTORY_LIMIT,
+        fallback_topic_color, general_help_text, history_timestamp, matrix_reply_target,
+        parse_help_command, parse_history_command, parse_reconcile_names_command,
+        startup_event_should_forward, topic_color_from_avatar, topic_help_text, HistoryCommand,
+        HistoryCommandKind, DEFAULT_HISTORY_LIMIT,
     };
     use crate::telegram::TELEGRAM_TOPIC_COLORS;
     use image::{Rgba, RgbaImage};
@@ -1942,6 +1983,16 @@ mod tests {
         assert!(!joined.contains("/accept"));
 
         assert!(topic_help_text(None).contains("není mapovaný"));
+    }
+
+    #[test]
+    fn history_timestamp_includes_seconds_and_calendar_date() {
+        let (day, time) = history_timestamp(1_700_000_000_123);
+        assert_eq!(time.len(), 8);
+        assert_eq!(time.as_bytes()[2], b':');
+        assert_eq!(time.as_bytes()[5], b':');
+        assert_eq!(day.matches('.').count(), 2);
+        assert!(day.len() >= 8);
     }
 
     #[test]
