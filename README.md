@@ -4,21 +4,62 @@ Self-hosted Reddit Chat <-> Telegram bridge written in Rust.
 
 The target deployment is Linux/Devuan without Rust, Cargo, a system OpenSSL installation, or a system SQLite library. Release builds are fully static MUSL binaries for `x86_64`, `aarch64`, and ARMv7 hard-float. Matrix and Telegram HTTPS use rustls; the Reddit `/chat/` token-mint request uses vendored native TLS/OpenSSL because live testing showed Reddit returning HTTP 403 for the equivalent rustls request. SQLite is compiled into the binary through `rusqlite`'s `bundled` feature.
 
-## v0.1 scope
+## Supported functionality
 
-- Reddit Chat text DMs -> Telegram forum topics
-- Telegram topic text -> Reddit Chat
-- one Reddit room = one Telegram topic
-- SQLite mapping, Matrix `/sync` checkpoint and Telegram `getUpdates` offset
-- event deduplication
-- Reddit message requests become `REQUEST · ...` topics with `/accept` and `/decline`
-- Matrix JWT is automatically re-minted from the logged-in Reddit browser cookie set without requiring a browser on the bridge host
-- successful Reddit -> Telegram delivery advances Reddit read markers (`m.fully_read`, `m.read`, `m.read.private`)
-- failed automatic Reddit authentication refresh raises one deduplicated warning in Telegram General and one recovery message after service resumes
-- no inbound TCP port and no Telegram webhook
-- first Matrix sync establishes a checkpoint and deliberately does not replay history
+### Messaging and conversation mapping
 
-Not implemented yet: media, reactions, edits/deletes, typing, starting a brand-new Reddit DM from Telegram, or reliable counterparty "seen" receipts (Reddit does not expose them through this Matrix sync stream).
+- bidirectional Reddit Chat text/notice relay: Reddit -> Telegram and Telegram -> Reddit
+- one Reddit Matrix room maps to one topic in a private Telegram forum supergroup
+- Reddit message requests become `REQUEST · <name>` topics and can be handled with `/accept` or `/decline`
+- Telegram messages are accepted only from the configured `telegram.operator_user_id`
+- human-readable Reddit names are resolved for both the remote participant and the local Reddit account
+- generic or stale topic names can be corrected with `/reconcile-names` or `/reconcile_names`
+- successful Reddit -> Telegram delivery advances Reddit-side `m.fully_read`, `m.read`, and `m.read.private` markers
+
+### History recovery and chat repair
+
+- `/reload-history [N] [dry-run]` reloads recent Reddit/Matrix history into the currently mapped Telegram topic without changing the global Matrix `/sync` checkpoint
+- `/reset-chat [N] [dry-run]` creates a replacement Telegram topic, replays history, atomically switches the SQLite mapping only after a successful replay, and archives/closes the old topic
+- history is fetched with Matrix pagination instead of relying on a single `/messages` page
+- every historical Reddit/Matrix event is sent as an individual Telegram message rather than as one combined transcript
+- replayed outgoing messages use a compact `>> <name>:` header and incoming messages use `<< <name>:`
+- history replay is Telegram rate-limit aware and honors Bot API `retry_after` responses
+- long-running administrative commands acknowledge the Telegram update before replay so a transient failure cannot execute the same `/reset-chat` repeatedly
+- replayed Matrix event IDs are persisted for deduplication so normal `/sync` processing does not forward the same history again
+
+The default history limit is 50 text/notice messages and the accepted maximum is 200. `dry-run` reports what would be processed without changing Telegram topics or SQLite mappings.
+
+### Authentication and recovery
+
+- no Reddit password is required on the bridge host
+- the bridge can reuse a valid saved Matrix session or current Reddit `token_v2`
+- short-lived Reddit Matrix authentication is automatically refreshed from the saved browser cookie set through Reddit `/chat/`
+- `/svc/shreddit/token` is retained as a fallback when a usable CSRF cookie is available
+- Matrix HTTP 401 invalidates the cached session, performs one refresh, and retries the failed operation once
+- short-lived Matrix credentials are persisted in SQLite while the long-lived Reddit browser session remains only in `config.toml`
+- authentication failures generate one deduplicated warning in Telegram General; successful recovery generates one recovery notification
+
+### Persistent state and reliability
+
+- SQLite stores Reddit-room <-> Telegram-topic mappings, Matrix `/sync` checkpoints, Telegram `getUpdates` offsets, Matrix event deduplication, pending read markers, authentication state, and the short-lived Matrix session
+- pending Reddit read markers survive restart and are retried without re-sending the Telegram message
+- the SQLite database file is forced to mode `0600` on Unix
+- the bridge uses Telegram long polling and requires no public IP address, inbound TCP port, or Telegram webhook
+- first Matrix `/sync` establishes a safe checkpoint and deliberately does not replay old joined-room timelines automatically; explicit `/reload-history` or `/reset-chat` is used when history recovery is wanted
+
+### Operations and deployment
+
+- `reddit2tg check` validates Reddit/Matrix authentication and Telegram bot/forum configuration before the daemon is started
+- `reddit2tg reconcile-names [--dry-run]` is available from the CLI in addition to the Telegram command
+- release builds are static MUSL binaries for `x86_64`, `aarch64`, and ARMv7 hard-float (`armhf`)
+- release packaging includes `.tar.gz` archives, Debian packages, and SHA256 checksums
+- Devuan/SysV init is supported, with an optional systemd unit included in the package
+
+### Current limitations
+
+Not implemented yet: media/file transfer, reactions, edits/deletes, typing indicators, starting a brand-new Reddit DM from Telegram, or reliable counterparty "seen" receipts. Reddit does not expose dependable remote-user read receipts through the Matrix sync stream, and the Telegram Bot API does not tell a bot when a human has opened a message.
+
+History recovery currently replays text/notice events only; media events are skipped until media bridging is implemented.
 
 ## Configuration values
 
@@ -313,6 +354,33 @@ The same operation is available from the configured Telegram operator account. S
 ```
 
 `/reconcile_names` is accepted as an alias for Telegram clients or bot-command tooling that prefers underscores. The reconciliation never creates rooms or topics: it only examines rows already present in the SQLite `rooms` mapping and renames a Telegram topic when the current Reddit counterpart name differs. Message-request topics retain their `REQUEST · ` prefix.
+
+### Reload or reset a mapped chat from Reddit history
+
+For a joined Reddit chat, the configured Telegram operator can replay recent Reddit/Matrix history directly from inside that chat's mapped Telegram topic. The default is 50 messages and the accepted range is 1-200:
+
+```text
+/reload-history
+/reload-history 100
+/reload-history dry-run
+/reload-history 100 dry-run
+```
+
+`/reload-history` fetches recent `m.room.message` history through Matrix `/rooms/{roomId}/messages`, renders it chronologically with the resolved Reddit sender names, and appends it to the current Telegram topic. It does not change the global Matrix `/sync` checkpoint and does not send read receipts for replayed history. Replayed event IDs are added to the normal dedup table only after Telegram delivery succeeds.
+
+Each replayed Matrix event is sent as its own Telegram message. The compact bold header is `>> <name>:` for messages sent by the bridged Reddit account and `<< <name>:` for messages received from the other side; the message body stays normal text.
+
+For a damaged or badly reconstructed Telegram topic, use the stronger reset operation:
+
+```text
+/reset-chat dry-run
+/reset-chat
+/reset-chat 100
+```
+
+`/reset-chat` first downloads the requested history, creates a new Telegram topic using the currently resolved Reddit counterpart name, replays the history there, and only then atomically switches the SQLite room mapping to the new `message_thread_id` together with the replayed dedup event IDs. After that succeeds, the previous topic is renamed with an `ARCHIVED · ` prefix and closed. If history delivery or the SQLite switch fails, the old mapping remains active and reddit2tg marks the incomplete new topic with an `INCOMPLETE · ` prefix and closes it.
+
+The underscore aliases `/reload_history` and `/reset_chat` are also accepted. Both commands must be sent inside an already mapped Telegram topic and only operate on rooms whose status is `joined`. `dry-run` performs the Matrix history lookup and reports the number of usable messages without changing Telegram or SQLite state.
 
 ### Read receipts
 

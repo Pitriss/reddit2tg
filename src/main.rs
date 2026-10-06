@@ -10,12 +10,18 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
-use crate::{bridge::Bridge, config::Config, db::Db, reddit::RedditClient, telegram::TelegramClient};
+use crate::{
+    bridge::Bridge, config::Config, db::Db, reddit::RedditClient, telegram::TelegramClient,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "reddit2tg", version, about = "Reddit Chat <-> Telegram bridge")]
 struct Cli {
-    #[arg(long, default_value = "/etc/reddit2tg/config.toml", env = "REDDIT2TG_CONFIG")]
+    #[arg(
+        long,
+        default_value = "/etc/reddit2tg/config.toml",
+        env = "REDDIT2TG_CONFIG"
+    )]
     config: PathBuf,
     #[command(subcommand)]
     command: Option<Command>,
@@ -34,7 +40,9 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .with_target(false)
         .compact()
         .init();

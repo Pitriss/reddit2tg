@@ -1,6 +1,6 @@
 use std::{fs, path::Path};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -35,7 +35,9 @@ pub struct StorageConfig {
 
 impl Default for StorageConfig {
     fn default() -> Self {
-        Self { path: default_db_path() }
+        Self {
+            path: default_db_path(),
+        }
     }
 }
 
@@ -67,16 +69,22 @@ fn default_db_path() -> String {
     "/var/lib/reddit2tg/reddit2tg.sqlite3".to_owned()
 }
 
-const fn default_matrix_timeout_ms() -> u64 { 10_000 }
-const fn default_telegram_timeout_secs() -> u64 { 45 }
-const fn default_refresh_before_secs() -> u64 { 3_600 }
+const fn default_matrix_timeout_ms() -> u64 {
+    10_000
+}
+const fn default_telegram_timeout_secs() -> u64 {
+    45
+}
+const fn default_refresh_before_secs() -> u64 {
+    3_600
+}
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("cannot read config {}", path.display()))?;
-        let cfg: Self = toml::from_str(&raw)
-            .with_context(|| format!("invalid TOML in {}", path.display()))?;
+        let cfg: Self =
+            toml::from_str(&raw).with_context(|| format!("invalid TOML in {}", path.display()))?;
         cfg.validate()?;
         Ok(cfg)
     }

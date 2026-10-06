@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 
 #[derive(Debug, Clone)]
 pub struct Db {
@@ -101,7 +101,9 @@ impl Db {
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
         let conn = self.connect()?;
         Ok(conn
-            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| row.get(0))
+            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
             .optional()?)
     }
 
@@ -196,7 +198,13 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    pub fn upsert_room(&self, room_id: &str, thread_id: i64, title: &str, status: &str) -> Result<()> {
+    pub fn upsert_room(
+        &self,
+        room_id: &str,
+        thread_id: i64,
+        title: &str,
+        status: &str,
+    ) -> Result<()> {
         let conn = self.connect()?;
         conn.execute(
             r#"INSERT INTO rooms(matrix_room_id, telegram_thread_id, title, status, updated_at)
@@ -250,6 +258,36 @@ impl Db {
         Ok(())
     }
 
+    pub fn replace_room_mapping_and_mark_seen(
+        &self,
+        room_id: &str,
+        thread_id: i64,
+        title: &str,
+        status: &str,
+        event_ids: &[String],
+    ) -> Result<()> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            r#"INSERT INTO rooms(matrix_room_id, telegram_thread_id, title, status, updated_at)
+               VALUES(?1, ?2, ?3, ?4, ?5)
+               ON CONFLICT(matrix_room_id) DO UPDATE SET
+                 telegram_thread_id = excluded.telegram_thread_id,
+                 title = excluded.title,
+                 status = excluded.status,
+                 updated_at = excluded.updated_at"#,
+            params![room_id, thread_id, title, status, now_unix()],
+        )?;
+        for event_id in event_ids {
+            tx.execute(
+                "INSERT OR IGNORE INTO seen_matrix_events(event_id, matrix_room_id, created_at) VALUES(?1, ?2, ?3)",
+                params![event_id, room_id, now_unix()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn queue_read_receipt(&self, room_id: &str, event_id: &str) -> Result<()> {
         let conn = self.connect()?;
         conn.execute(
@@ -284,7 +322,10 @@ impl Db {
     pub fn prune_seen_events(&self, older_than_secs: i64) -> Result<usize> {
         let conn = self.connect()?;
         let cutoff = now_unix().saturating_sub(older_than_secs);
-        Ok(conn.execute("DELETE FROM seen_matrix_events WHERE created_at < ?1", [cutoff])?)
+        Ok(conn.execute(
+            "DELETE FROM seen_matrix_events WHERE created_at < ?1",
+            [cutoff],
+        )?)
     }
 }
 

@@ -5,8 +5,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, anyhow, bail};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use anyhow::{anyhow, bail, Context, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use serde_json::Value;
@@ -146,6 +146,13 @@ struct SendResponse {
     event_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct MessagesResponse {
+    #[serde(default)]
+    chunk: Vec<MatrixEvent>,
+    end: Option<String>,
+}
+
 impl RedditClient {
     pub fn new(cfg: &Config, db: Db) -> Result<Self> {
         let http = Client::builder()
@@ -171,7 +178,9 @@ impl RedditClient {
 
     pub async fn authenticate(&self) -> Result<MatrixSession> {
         if cookie_value(&self.cookie_header, "reddit_session").is_none() {
-            return Err(auth_error("reddit.session is missing reddit_session cookie"));
+            return Err(auth_error(
+                "reddit.session is missing reddit_session cookie",
+            ));
         }
 
         if let Some(stored) = self.db.load_matrix_session()? {
@@ -248,7 +257,9 @@ impl RedditClient {
 
     async fn refresh_matrix_session(&self) -> Result<MatrixSession> {
         if cookie_value(&self.cookie_header, "reddit_session").is_none() {
-            return Err(auth_error("reddit.session is missing reddit_session cookie"));
+            return Err(auth_error(
+                "reddit.session is missing reddit_session cookie",
+            ));
         }
 
         let token = match self.mint_token_via_chat().await {
@@ -266,9 +277,13 @@ impl RedditClient {
             }
         };
 
-        self.register_matrix_session(&token.token).await.map_err(|error| {
-            auth_error(format!("Matrix rejected freshly minted Reddit token: {error}"))
-        })?;
+        self.register_matrix_session(&token.token)
+            .await
+            .map_err(|error| {
+                auth_error(format!(
+                    "Matrix rejected freshly minted Reddit token: {error}"
+                ))
+            })?;
 
         let expires_at_ms = token
             .expires
@@ -382,7 +397,10 @@ impl RedditClient {
                 truncate(&body, 300)
             );
         }
-        let whoami: WhoAmI = response.json().await.context("invalid Matrix whoami JSON")?;
+        let whoami: WhoAmI = response
+            .json()
+            .await
+            .context("invalid Matrix whoami JSON")?;
         Ok(MatrixSession {
             expires_at_ms: expires_at_ms.or_else(|| jwt_expires_at_ms(&token)),
             access_token: token,
@@ -407,7 +425,10 @@ impl RedditClient {
     }
 
     async fn refresh_after_unauthorized(&self, operation: &str) -> Result<()> {
-        warn!(operation, "Matrix returned 401; invalidating session and refreshing once");
+        warn!(
+            operation,
+            "Matrix returned 401; invalidating session and refreshing once"
+        );
         self.invalidate_session().await?;
         self.refresh_matrix_session().await?;
         Ok(())
@@ -423,11 +444,15 @@ impl RedditClient {
             let session = self.ensure_session(refresh_before_secs).await?;
             let url = format!("{}/_matrix/client/v3/sync", self.homeserver);
             let filter = r#"{"room":{"timeline":{"unread_thread_notifications":true,"not_types":["com.reddit.review_open","com.reddit.review_close"],"lazy_load_members":true},"state":{"lazy_load_members":true}}}"#;
-            let mut req = self.http.get(url).bearer_auth(&session.access_token).query(&[
-                ("timeout", timeout_ms.to_string()),
-                ("set_presence", "offline".to_owned()),
-                ("filter", filter.to_owned()),
-            ]);
+            let mut req = self
+                .http
+                .get(url)
+                .bearer_auth(&session.access_token)
+                .query(&[
+                    ("timeout", timeout_ms.to_string()),
+                    ("set_presence", "offline".to_owned()),
+                    ("filter", filter.to_owned()),
+                ]);
             if let Some(since) = since {
                 req = req.query(&[("since", since)]);
             }
@@ -438,7 +463,9 @@ impl RedditClient {
                     continue;
                 }
                 self.invalidate_session().await?;
-                return Err(auth_error("Matrix /sync rejected the refreshed access token"));
+                return Err(auth_error(
+                    "Matrix /sync rejected the refreshed access token",
+                ));
             }
             let response = response.error_for_status().context("Matrix /sync failed")?;
             return Ok(response.json().await?);
@@ -475,7 +502,9 @@ impl RedditClient {
                     continue;
                 }
                 self.invalidate_session().await?;
-                return Err(auth_error("Matrix send rejected the refreshed access token"));
+                return Err(auth_error(
+                    "Matrix send rejected the refreshed access token",
+                ));
             }
             let response: SendResponse = response
                 .error_for_status()
@@ -579,6 +608,115 @@ impl RedditClient {
         unreachable!()
     }
 
+    pub async fn room_messages(
+        &self,
+        room_id: &str,
+        limit: usize,
+        refresh_before_secs: u64,
+    ) -> Result<Vec<MatrixEvent>> {
+        let target = limit.clamp(1, 200);
+        let room = urlencoding::encode(room_id);
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{room}/messages",
+            self.homeserver
+        );
+        let mut from: Option<String> = None;
+        let mut collected = Vec::new();
+
+        // Matrix is allowed to return fewer events than requested. Follow the
+        // `end` token until we have the requested number of usable text/notice
+        // messages (or the server has no older history left).
+        for _ in 0..50 {
+            if collected.len() >= target {
+                break;
+            }
+
+            let mut page_result: Option<MessagesResponse> = None;
+            for attempt in 0..2 {
+                let session = self.ensure_session(refresh_before_secs).await?;
+                let mut request = self
+                    .http
+                    .get(&url)
+                    .bearer_auth(&session.access_token)
+                    .query(&[
+                        ("dir", "b".to_owned()),
+                        ("limit", "100".to_owned()),
+                        ("filter", r#"{"types":["m.room.message"]}"#.to_owned()),
+                    ]);
+                if let Some(token) = from.as_deref() {
+                    request = request.query(&[("from", token)]);
+                }
+
+                let response = request
+                    .send()
+                    .await
+                    .context("Matrix room history request failed")?;
+                if response.status() == StatusCode::UNAUTHORIZED {
+                    if attempt == 0 {
+                        self.refresh_after_unauthorized("room history").await?;
+                        continue;
+                    }
+                    self.invalidate_session().await?;
+                    return Err(auth_error(
+                        "Matrix room history rejected the refreshed access token",
+                    ));
+                }
+
+                let response = response
+                    .error_for_status()
+                    .context("Matrix room history failed")?;
+                page_result = Some(
+                    response
+                        .json()
+                        .await
+                        .context("invalid Matrix room history JSON")?,
+                );
+                break;
+            }
+
+            let page = page_result
+                .ok_or_else(|| anyhow!("Matrix room history request produced no response"))?;
+            let MessagesResponse { chunk, end } = page;
+            if chunk.is_empty() {
+                break;
+            }
+
+            for event in chunk {
+                if event.event_type != "m.room.message" || event.event_id.is_empty() {
+                    continue;
+                }
+                let msgtype = event
+                    .content
+                    .get("msgtype")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if msgtype != "m.text" && msgtype != "m.notice" {
+                    continue;
+                }
+                collected.push(event);
+                if collected.len() >= target {
+                    break;
+                }
+            }
+
+            if collected.len() >= target {
+                break;
+            }
+            let Some(next) = end.filter(|token| !token.is_empty()) else {
+                break;
+            };
+            if from.as_deref() == Some(next.as_str()) {
+                break;
+            }
+            from = Some(next);
+        }
+
+        collected.truncate(target);
+        // dir=b yields newest -> oldest; Telegram replay should be chronological.
+        collected.reverse();
+        Ok(collected)
+    }
+
     pub async fn own_display_name(&self, refresh_before_secs: u64) -> Option<String> {
         if let Some(name) = self.cached_own_display_name.read().await.clone() {
             return Some(name);
@@ -643,7 +781,9 @@ impl RedditClient {
             }
             if response.status().is_success() {
                 if let Ok(value) = response.json::<Value>().await {
-                    if let Some(counterpart) = counterpart_from_joined_members(&value, &session.user_id) {
+                    if let Some(counterpart) =
+                        counterpart_from_joined_members(&value, &session.user_id)
+                    {
                         return Some(counterpart);
                     }
                 }
@@ -654,10 +794,7 @@ impl RedditClient {
         // membership=invite. joined_members does not include that user, so
         // inspect the full room membership before falling back to a generic
         // Telegram topic title.
-        let members_url = format!(
-            "{}/_matrix/client/v3/rooms/{room}/members",
-            self.homeserver
-        );
+        let members_url = format!("{}/_matrix/client/v3/rooms/{room}/members", self.homeserver);
         let response = self
             .http
             .get(members_url)
@@ -676,7 +813,6 @@ impl RedditClient {
         counterpart_from_members(&value, &session.user_id)
     }
 }
-
 
 fn counterpart_from_joined_members(value: &Value, own_user_id: &str) -> Option<(String, String)> {
     let joined = value.get("joined")?.as_object()?;
@@ -710,7 +846,10 @@ fn counterpart_from_members(value: &Value, own_user_id: &str) -> Option<(String,
         let Some(content) = event.get("content") else {
             continue;
         };
-        let membership = content.get("membership").and_then(Value::as_str).unwrap_or("");
+        let membership = content
+            .get("membership")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         if membership != "join" && membership != "invite" {
             continue;
         }
@@ -862,12 +1001,15 @@ fn truncate(value: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{counterpart_from_members, extract_token_blob, jwt_expires_at_ms, strip_cookie};
-    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
     #[test]
     fn strips_only_token_v2_cookie() {
         let value = "reddit_session=abc; token_v2=old; loid=xyz";
-        assert_eq!(strip_cookie(value, "token_v2"), "reddit_session=abc; loid=xyz");
+        assert_eq!(
+            strip_cookie(value, "token_v2"),
+            "reddit_session=abc; loid=xyz"
+        );
     }
 
     #[test]
