@@ -187,6 +187,15 @@ impl Db {
             .optional()?)
     }
 
+    pub fn rooms(&self) -> Result<Vec<RoomMap>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT matrix_room_id, telegram_thread_id, title, status FROM rooms ORDER BY telegram_thread_id",
+        )?;
+        let rows = stmt.query_map([], room_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn upsert_room(&self, room_id: &str, thread_id: i64, title: &str, status: &str) -> Result<()> {
         let conn = self.connect()?;
         conn.execute(

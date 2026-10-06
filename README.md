@@ -2,7 +2,7 @@
 
 Self-hosted Reddit Chat <-> Telegram bridge written in Rust.
 
-The target deployment is Linux/Devuan without Rust, Cargo, OpenSSL, or a system SQLite library installed. Release builds are fully static MUSL binaries for `x86_64`, `aarch64`, and ARMv7 hard-float; HTTPS uses rustls and SQLite is compiled into the binary through `rusqlite`'s `bundled` feature.
+The target deployment is Linux/Devuan without Rust, Cargo, a system OpenSSL installation, or a system SQLite library. Release builds are fully static MUSL binaries for `x86_64`, `aarch64`, and ARMv7 hard-float. Matrix and Telegram HTTPS use rustls; the Reddit `/chat/` token-mint request uses vendored native TLS/OpenSSL because live testing showed Reddit returning HTTP 403 for the equivalent rustls request. SQLite is compiled into the binary through `rusqlite`'s `bundled` feature.
 
 ## v0.1 scope
 
@@ -26,7 +26,7 @@ Not implemented yet: media, reactions, edits/deletes, typing, starting a brand-n
 
 | Config key | Meaning |
 | --- | --- |
-| `reddit.session` | Cookie-header-shaped Reddit browser session containing `reddit_session`; other cookies such as `token_v2`, `csrf_token`, `loid`, `session_tracker` and `edgebucket` are retained when available |
+| `reddit.session` | Complete Cookie-header-shaped browser session applicable to `https://www.reddit.com/chat/`; it must contain `reddit_session`, and other applicable Reddit cookies should be retained rather than reduced to a small whitelist |
 | `telegram.bot_token` | Telegram Bot API token issued by `@BotFather` |
 | `telegram.chat_id` | numeric ID of the private Telegram forum supergroup used by the bridge |
 | `telegram.operator_user_id` | numeric Telegram user ID of the only account allowed to relay messages to Reddit |
@@ -144,7 +144,7 @@ unset TG_BOT_TOKEN
 
 ## Reddit authentication
 
-`reddit2tg` does not need your Reddit password and does not need Firefox/Chromium on the server. The bridge uses cookies copied from an already logged-in Reddit browser session. `reddit_session` is the only mandatory cookie. A current `token_v2` may be reused at startup, but automatic long-running refresh does not depend on it.
+`reddit2tg` does not need your Reddit password and does not need Firefox/Chromium on the server. The bridge uses cookies copied from an already logged-in Reddit browser session. `reddit_session` must be present, but for reliable automatic refresh keep the **complete set of unexpired cookies that the browser would send to `https://www.reddit.com/chat/`**. Live testing showed that reducing the session to only a small cookie whitelist can make Reddit return HTTP 403. A current `token_v2` may be reused at startup, but automatic long-running refresh does not depend on it.
 
 For automatic refresh, `reddit2tg` requests `https://www.reddit.com/chat/` with the saved Reddit cookie jar **after removing the `token_v2` cookie**. Reddit then server-renders a fresh short-lived Matrix JWT into the `<rs-app token="...">` bootstrap element. The bridge extracts that JWT, registers it with `https://matrix.redditspace.com/_matrix/client/v3/login` using Reddit's `com.reddit.token` login type, verifies it with Matrix `/account/whoami`, and stores only this short-lived Matrix session in SQLite. If `/chat/` minting fails and a `csrf_token` cookie is available, `/svc/shreddit/token` is retained as a fallback.
 
@@ -168,7 +168,7 @@ Then run from the repository root:
 bash scripts/firefox-reddit-cookies.sh
 ```
 
-The helper finds the first Firefox `cookies.sqlite`, makes a private temporary copy together with its WAL/SHM files, selects the newest Reddit values for `reddit_session`, `token_v2`, `csrf_token`, `loid`, `session_tracker` and `edgebucket` that actually exist, and puts the resulting Cookie-header-shaped string directly into the X11 clipboard. It does not print the secret values. It prints only cookie names and their lengths.
+The helper finds the first Firefox `cookies.sqlite`, makes a private temporary copy together with its WAL/SHM files, selects **all unexpired cookies whose domain and path apply to `https://www.reddit.com/chat/`**, and puts the resulting Cookie-header-shaped string directly into the X11 clipboard. It does not print the secret values. It prints only cookie names and their lengths.
 
 If Firefox has more than one profile, pass the desired database explicitly:
 
@@ -176,25 +176,23 @@ If Firefox has more than one profile, pass the desired database explicitly:
 bash scripts/firefox-reddit-cookies.sh /home/peva/.mozilla/firefox/h7v1hpbn.default-esr/cookies.sqlite
 ```
 
-The clipboard will contain a value shaped like this:
+The clipboard contains the complete Cookie-header-shaped value. Some valid Reddit cookies can themselves contain JSON quotes, so **do not paste the raw clipboard contents directly between TOML quotes**. Insert it into an existing `config.toml` with TOML-safe escaping instead:
 
-```text
-reddit_session=...; token_v2=...; loid=...; session_tracker=...; edgebucket=...
+```sh
+xclip -selection clipboard -o | python3 -c 'import sys,re,json; p="config.toml"; v=sys.stdin.read(); s=open(p,encoding="utf-8").read(); r="session = "+json.dumps(v); s,n=re.subn(r"(?m)^session\s*=.*$",lambda m:r,s,count=1); assert n==1,"session line not found"; open(p,"w",encoding="utf-8").write(s)'
 ```
 
-Paste that complete string between the quotes of `reddit.session`:
+Verify the file without printing the credential:
 
-```toml
-[reddit]
-session = "reddit_session=...; token_v2=...; loid=...; session_tracker=...; edgebucket=..."
-homeserver = "https://matrix.redditspace.com"
+```sh
+python3 -c 'import tomllib; tomllib.load(open("config.toml","rb")); print("config.toml: OK")'
 ```
 
-`reddit_session` must be present. `token_v2` and `csrf_token` are optional. A current `token_v2` can speed up initial startup; during automatic refresh it is deliberately omitted from the `/chat/` request so Reddit mints a new Matrix JWT. `csrf_token` is used only by the fallback `/svc/shreddit/token` flow. Additional Reddit cookies are retained because they belong to the established browser session. Do not commit or share this value.
+`reddit_session` must be present. Keep all other applicable cookies captured by the helper. A current `token_v2` can speed up initial startup; during automatic refresh it is deliberately omitted from the `/chat/` request so Reddit mints a new Matrix JWT. `csrf_token` is used only by the fallback `/svc/shreddit/token` flow. Do not commit or share this value.
 
 ### 3. Manual browser method
 
-If the Firefox helper cannot be used, copy the available Reddit cookies from a logged-in `www.reddit.com` session. `reddit_session` is mandatory; `token_v2` or `csrf_token` are useful when present. Construct a normal Cookie header, for example:
+If the Firefox helper cannot be used, copy the full set of unexpired cookies that the browser sends to `https://www.reddit.com/chat/` from a logged-in `www.reddit.com` session. `reddit_session` must be present; do not intentionally discard other applicable cookies. Construct a normal Cookie header, for example:
 
 ```text
 reddit_session=VALUE1; token_v2=VALUE2
@@ -292,6 +290,29 @@ For a foreground test on the build machine:
 Stop it with `Ctrl+C`.
 
 Do not simultaneously run another process using `getUpdates` with the same Telegram bot token. Bot API updates are a single stream and competing consumers will interfere with each other.
+
+### Reconcile existing Telegram topic names
+
+Existing room mappings can be rechecked against current Reddit/Matrix membership without creating a new chat or sending a Reddit message. A dry run only reports differences:
+
+```sh
+cargo run --locked -- --config ./config.toml reconcile-names --dry-run
+```
+
+Apply the detected renames with:
+
+```sh
+cargo run --locked -- --config ./config.toml reconcile-names
+```
+
+The same operation is available from the configured Telegram operator account. Send either command in the bridge supergroup; the result is posted to the General topic:
+
+```text
+/reconcile-names dry-run
+/reconcile-names
+```
+
+`/reconcile_names` is accepted as an alias for Telegram clients or bot-command tooling that prefers underscores. The reconciliation never creates rooms or topics: it only examines rows already present in the SQLite `rooms` mapping and renames a Telegram topic when the current Reddit counterpart name differs. Message-request topics retain their `REQUEST · ` prefix.
 
 ### Read receipts
 

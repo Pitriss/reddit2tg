@@ -39,6 +39,98 @@ impl Bridge {
         Ok(())
     }
 
+    pub async fn reconcile_names(&self, dry_run: bool) -> Result<String> {
+        self.reddit
+            .ensure_session(self.cfg.bridge.refresh_before_secs)
+            .await?;
+
+        let rooms = self.db.rooms()?;
+        let mut checked = 0usize;
+        let mut renamed = 0usize;
+        let mut unchanged = 0usize;
+        let mut unresolved = 0usize;
+        let mut errors = 0usize;
+        let mut details = Vec::new();
+
+        for room in rooms {
+            checked += 1;
+            let Some((user_id, mut name)) = self
+                .reddit
+                .room_counterpart(&room.matrix_room_id, self.cfg.bridge.refresh_before_secs)
+                .await
+            else {
+                unresolved += 1;
+                details.push(format!(
+                    "? topic {}: {} (protistranu se nepodařilo zjistit)",
+                    room.telegram_thread_id, room.title
+                ));
+                continue;
+            };
+
+            let fallback_name = matrix_localpart(&user_id);
+            if name == fallback_name {
+                if let Some(profile_name) = self
+                    .reddit
+                    .profile_name(&user_id, self.cfg.bridge.refresh_before_secs)
+                    .await
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    name = profile_name;
+                }
+            }
+
+            let expected = reconciled_title(&room.status, &name);
+            if expected == room.title {
+                unchanged += 1;
+                continue;
+            }
+
+            if dry_run {
+                renamed += 1;
+                details.push(format!(
+                    "~ topic {}: {} -> {}",
+                    room.telegram_thread_id, room.title, expected
+                ));
+                continue;
+            }
+
+            match self.telegram.rename_topic(room.telegram_thread_id, &expected).await {
+                Ok(()) => {
+                    self.db.set_room_title(&room.matrix_room_id, &expected)?;
+                    renamed += 1;
+                    details.push(format!(
+                        "✓ topic {}: {} -> {}",
+                        room.telegram_thread_id, room.title, expected
+                    ));
+                    info!(
+                        matrix_room_id = %room.matrix_room_id,
+                        telegram_thread_id = room.telegram_thread_id,
+                        old_title = %room.title,
+                        new_title = %expected,
+                        "Telegram topic renamed by reconcile-names"
+                    );
+                }
+                Err(error) => {
+                    errors += 1;
+                    details.push(format!(
+                        "! topic {}: přejmenování {} -> {} selhalo: {}",
+                        room.telegram_thread_id, room.title, expected, error
+                    ));
+                }
+            }
+        }
+
+        let mode = if dry_run { "dry-run" } else { "apply" };
+        let mut report = format!(
+            "reddit2tg reconcile-names ({mode})\nchecked: {checked}\nrenamed: {renamed}\nunchanged: {unchanged}\nunresolved: {unresolved}\nerrors: {errors}"
+        );
+        if !details.is_empty() {
+            report.push_str("\n\n");
+            report.push_str(&details.join("\n"));
+        }
+        Ok(report)
+    }
+
     pub async fn run(self) -> Result<()> {
         self.telegram.probe().await?;
         match self.reddit.authenticate().await {
@@ -159,9 +251,47 @@ impl Bridge {
             }
         }
         if counterpart.is_none() {
-            counterpart = self.reddit.joined_counterpart(room_id, self.cfg.bridge.refresh_before_secs).await;
+            counterpart = self
+                .reddit
+                .room_counterpart(room_id, self.cfg.bridge.refresh_before_secs)
+                .await;
+        }
+        if counterpart.is_none()
+            && room
+                .timeline
+                .events
+                .iter()
+                .any(|event| event.event_type == "m.room.message" && event.sender == own)
+        {
+            // Reddit may expose the invite membership a fraction later than
+            // the first locally-sent event. Give it two short chances so an
+            // outgoing-first conversation gets a human topic name immediately.
+            for delay_ms in [150u64, 400u64] {
+                sleep(Duration::from_millis(delay_ms)).await;
+                counterpart = self
+                    .reddit
+                    .room_counterpart(room_id, self.cfg.bridge.refresh_before_secs)
+                    .await;
+                if counterpart.is_some() {
+                    break;
+                }
+            }
+        }
+        if let Some((user_id, name)) = counterpart.as_mut() {
+            let fallback_name = matrix_localpart(user_id);
+            if name.as_str() == fallback_name.as_str() {
+                if let Some(profile_name) = self
+                    .reddit
+                    .profile_name(user_id, self.cfg.bridge.refresh_before_secs)
+                    .await
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    *name = profile_name;
+                }
+            }
         }
         let mapping = self.ensure_room_mapping(room_id, counterpart.as_ref().map(|(_, n)| n.as_str()), "joined").await?;
+        let own_display_name = self.reddit.own_display_name(self.cfg.bridge.refresh_before_secs).await;
 
         for event in room.timeline.events {
             if event.event_type != "m.room.message" || event.event_id.is_empty() {
@@ -176,7 +306,8 @@ impl Bridge {
                 continue;
             }
             let rendered = if event.sender == own {
-                format!("Ty (Reddit): {body}")
+                let sender_name = own_display_name.as_deref().unwrap_or("Ty (Reddit)");
+                format!("{sender_name}: {body}")
             } else {
                 body.to_owned()
             };
@@ -342,11 +473,29 @@ impl Bridge {
     }
 
     async fn process_telegram_message(&self, update_id: i64, message: &Message) -> Result<()> {
+        let Some(text) = message.text.as_deref() else { return Ok(()) };
+
+        if let Some(command) = parse_reconcile_names_command(text) {
+            match command {
+                Ok(dry_run) => {
+                    let report = self.reconcile_names(dry_run).await?;
+                    self.telegram.send_general(&report).await?;
+                }
+                Err(()) => {
+                    self.telegram
+                        .send_general(
+                            "Použití: /reconcile-names nebo /reconcile-names dry-run",
+                        )
+                        .await?;
+                }
+            }
+            return Ok(());
+        }
+
         let Some(thread_id) = message.message_thread_id else {
             warn!(message_id = message.message_id, is_topic_message = ?message.is_topic_message, "Telegram operator message has no message_thread_id; ignoring General/non-topic message");
             return Ok(());
         };
-        let Some(text) = message.text.as_deref() else { return Ok(()) };
         let Some(room) = self.db.room_by_thread(thread_id)? else {
             warn!(thread_id, "message arrived in an unmapped Telegram topic");
             return Ok(());
@@ -390,9 +539,59 @@ impl Bridge {
     }
 }
 
+fn reconciled_title(status: &str, name: &str) -> String {
+    let name = clean_name(name);
+    if status == "invite" {
+        format!("REQUEST · {name}")
+    } else {
+        name
+    }
+}
+
+fn parse_reconcile_names_command(input: &str) -> Option<std::result::Result<bool, ()>> {
+    let mut parts = input.split_whitespace();
+    let first = parts.next()?;
+    let command = first.split('@').next().unwrap_or(first);
+    if command != "/reconcile-names" && command != "/reconcile_names" {
+        return None;
+    }
+
+    match (parts.next(), parts.next()) {
+        (None, None) => Some(Ok(false)),
+        (Some("dry-run" | "--dry-run"), None) => Some(Ok(true)),
+        _ => Some(Err(())),
+    }
+}
+
 fn clean_name(value: &str) -> String {
     let v = value.trim();
     let base = if v.is_empty() { "Reddit chat" } else { v };
     base.chars().take(110).collect()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::parse_reconcile_names_command;
+
+    #[test]
+    fn reconcile_names_command_accepts_hyphen_and_underscore_forms() {
+        assert_eq!(parse_reconcile_names_command("/reconcile-names"), Some(Ok(false)));
+        assert_eq!(
+            parse_reconcile_names_command("/reconcile_names dry-run"),
+            Some(Ok(true))
+        );
+        assert_eq!(
+            parse_reconcile_names_command("/reconcile_names@reddit2tg_bot --dry-run"),
+            Some(Ok(true))
+        );
+    }
+
+    #[test]
+    fn reconcile_names_command_rejects_extra_arguments() {
+        assert_eq!(
+            parse_reconcile_names_command("/reconcile-names dry-run now"),
+            Some(Err(()))
+        );
+        assert_eq!(parse_reconcile_names_command("hello"), None);
+    }
+}

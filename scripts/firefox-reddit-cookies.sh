@@ -16,11 +16,18 @@ cp "$DB" "$TMP/cookies.sqlite"
 [ ! -f "$DB-wal" ] || cp "$DB-wal" "$TMP/cookies.sqlite-wal"
 [ ! -f "$DB-shm" ] || cp "$DB-shm" "$TMP/cookies.sqlite-shm"
 
-SQL="WITH ranked AS (SELECT name,value,lastAccessed,ROW_NUMBER() OVER (PARTITION BY name ORDER BY lastAccessed DESC) AS rn FROM moz_cookies WHERE host LIKE '%reddit.com%' AND name IN ('reddit_session','token_v2','csrf_token','loid','session_tracker','edgebucket')) SELECT group_concat(name || '=' || value, '; ') FROM ranked WHERE rn=1;"
-COOKIE_HEADER=$(sqlite3 "$TMP/cookies.sqlite" "$SQL")
-printf '%s' "$COOKIE_HEADER" | grep -q 'reddit_session=' || { echo "reddit_session cookie not found" >&2; exit 1; }
+# Build the Cookie header Firefox would use for https://www.reddit.com/chat/.
+# The old helper copied only a small whitelist. Reddit's /chat/ bootstrap can
+# require additional browser-session cookies, so keep every unexpired cookie
+# whose domain and path are applicable to this request. Longer paths go first,
+# matching normal browser cookie ordering. Duplicate cookie names are retained.
+COOKIE_SQL="SELECT group_concat(pair, '; ') FROM (SELECT name || '=' || value AS pair FROM moz_cookies WHERE expiry > strftime('%s','now') AND (host = 'www.reddit.com' OR host = '.reddit.com' OR host = 'reddit.com') AND substr('/chat/', 1, length(path)) = path ORDER BY length(path) DESC, creationTime ASC);"
+INFO_SQL="SELECT name || ': ' || length(value) || ' chars' FROM moz_cookies WHERE expiry > strftime('%s','now') AND (host = 'www.reddit.com' OR host = '.reddit.com' OR host = 'reddit.com') AND substr('/chat/', 1, length(path)) = path ORDER BY length(path) DESC, creationTime ASC;"
+
+COOKIE_HEADER=$(sqlite3 "$TMP/cookies.sqlite" "$COOKIE_SQL")
+printf '%s' "$COOKIE_HEADER" | grep -q 'reddit_session=' || { echo "reddit_session cookie not found for https://www.reddit.com/chat/" >&2; exit 1; }
 printf '%s' "$COOKIE_HEADER" | xclip -selection clipboard
 
-echo "Reddit cookie header copied to X11 clipboard from: $DB"
-printf '%s' "$COOKIE_HEADER" | grep -q 'csrf_token=' || echo "note: csrf_token cookie is absent; reddit2tg will try token_v2 or obtain CSRF from Reddit /login/"
-sqlite3 "$TMP/cookies.sqlite" "WITH ranked AS (SELECT name,value,lastAccessed,ROW_NUMBER() OVER (PARTITION BY name ORDER BY lastAccessed DESC) AS rn FROM moz_cookies WHERE host LIKE '%reddit.com%' AND name IN ('reddit_session','token_v2','csrf_token','loid','session_tracker','edgebucket')) SELECT name || ': ' || length(value) || ' chars' FROM ranked WHERE rn=1 ORDER BY name;"
+echo "Reddit /chat/ cookie header copied to X11 clipboard from: $DB"
+echo "Included cookies (values are not printed):"
+sqlite3 "$TMP/cookies.sqlite" "$INFO_SQL"

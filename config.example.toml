@@ -1,8 +1,9 @@
 [reddit]
-# Cookie-header-shaped value from a logged-in www.reddit.com session.
-# Must contain reddit_session. token_v2/csrf_token and other Reddit cookies are optional helpers.
-# The Firefox helper script can copy the available cookie set safely.
-session = "reddit_session=PASTE_VALUE; csrf_token=PASTE_VALUE"
+# Complete Cookie-header-shaped browser session for https://www.reddit.com/chat/.
+# Must contain reddit_session. Keep all other unexpired cookies applicable to /chat/;
+# reducing this to a small whitelist can make Reddit reject automatic refresh with HTTP 403.
+# Use scripts/firefox-reddit-cookies.sh and TOML-safe escaping as documented in README.md.
+session = "PASTE_TOML_ESCAPED_COOKIE_HEADER_HERE"
 homeserver = "https://matrix.redditspace.com"
 
 [telegram]

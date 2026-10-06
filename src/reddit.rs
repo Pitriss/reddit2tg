@@ -73,9 +73,11 @@ fn auth_error(message: impl Into<String>) -> anyhow::Error {
 #[derive(Clone)]
 pub struct RedditClient {
     http: Client,
+    reddit_http: Client,
     homeserver: String,
     cookie_header: String,
     session: Arc<RwLock<Option<MatrixSession>>>,
+    cached_own_display_name: Arc<RwLock<Option<String>>>,
     db: Db,
 }
 
@@ -148,13 +150,21 @@ impl RedditClient {
     pub fn new(cfg: &Config, db: Db) -> Result<Self> {
         let http = Client::builder()
             .user_agent(UA)
+            .use_rustls_tls()
+            .timeout(Duration::from_secs(70))
+            .build()?;
+        let reddit_http = Client::builder()
+            .user_agent(UA)
+            .use_native_tls()
             .timeout(Duration::from_secs(70))
             .build()?;
         Ok(Self {
             http,
+            reddit_http,
             homeserver: cfg.reddit.homeserver.trim_end_matches('/').to_owned(),
             cookie_header: cfg.reddit_cookie_header(),
             session: Arc::new(RwLock::new(None)),
+            cached_own_display_name: Arc::new(RwLock::new(None)),
             db,
         })
     }
@@ -280,7 +290,7 @@ impl RedditClient {
     async fn mint_token_via_chat(&self) -> Result<TokenBlob> {
         let cookie_header = strip_cookie(&self.cookie_header, "token_v2");
         let response = self
-            .http
+            .reddit_http
             .get(REDDIT_CHAT_URL)
             .header("Cookie", cookie_header)
             .header(
@@ -305,7 +315,7 @@ impl RedditClient {
             .ok_or_else(|| anyhow!("csrf_token cookie is unavailable"))?;
         let form = format!("csrf_token={}", urlencoding::encode(&csrf));
         let response = self
-            .http
+            .reddit_http
             .post(REDDIT_TOKEN_URL)
             .header("Cookie", &self.cookie_header)
             .header("Content-Type", "application/x-www-form-urlencoded")
@@ -569,6 +579,23 @@ impl RedditClient {
         unreachable!()
     }
 
+    pub async fn own_display_name(&self, refresh_before_secs: u64) -> Option<String> {
+        if let Some(name) = self.cached_own_display_name.read().await.clone() {
+            return Some(name);
+        }
+
+        let user_id = self.ensure_session(refresh_before_secs).await.ok()?.user_id;
+        let name = self.profile_name(&user_id, refresh_before_secs).await?;
+        let name = name.trim();
+        if name.is_empty() {
+            return None;
+        }
+
+        let name = name.to_owned();
+        *self.cached_own_display_name.write().await = Some(name.clone());
+        Some(name)
+    }
+
     pub async fn profile_name(&self, user_id: &str, refresh_before_secs: u64) -> Option<String> {
         let session = self.ensure_session(refresh_before_secs).await.ok()?;
         let user = urlencoding::encode(user_id);
@@ -591,20 +618,49 @@ impl RedditClient {
             .map(str::to_owned)
     }
 
-    pub async fn joined_counterpart(
+    pub async fn room_counterpart(
         &self,
         room_id: &str,
         refresh_before_secs: u64,
     ) -> Option<(String, String)> {
         let session = self.ensure_session(refresh_before_secs).await.ok()?;
         let room = urlencoding::encode(room_id);
-        let url = format!(
+
+        let joined_url = format!(
             "{}/_matrix/client/v3/rooms/{room}/joined_members",
+            self.homeserver
+        );
+        if let Ok(response) = self
+            .http
+            .get(joined_url)
+            .bearer_auth(&session.access_token)
+            .send()
+            .await
+        {
+            if response.status() == StatusCode::UNAUTHORIZED {
+                let _ = self.invalidate_session().await;
+                return None;
+            }
+            if response.status().is_success() {
+                if let Ok(value) = response.json::<Value>().await {
+                    if let Some(counterpart) = counterpart_from_joined_members(&value, &session.user_id) {
+                        return Some(counterpart);
+                    }
+                }
+            }
+        }
+
+        // When we initiate a Reddit chat, the other user can still have
+        // membership=invite. joined_members does not include that user, so
+        // inspect the full room membership before falling back to a generic
+        // Telegram topic title.
+        let members_url = format!(
+            "{}/_matrix/client/v3/rooms/{room}/members",
             self.homeserver
         );
         let response = self
             .http
-            .get(url)
+            .get(members_url)
             .bearer_auth(&session.access_token)
             .send()
             .await
@@ -617,22 +673,56 @@ impl RedditClient {
             return None;
         }
         let value: Value = response.json().await.ok()?;
-        let joined = value.get("joined")?.as_object()?;
-        for (user_id, member) in joined {
-            if user_id == &session.user_id {
-                continue;
-            }
-            let name = member
-                .get("display_name")
-                .or_else(|| member.get("displayname"))
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .map(str::to_owned)
-                .unwrap_or_else(|| matrix_localpart(user_id));
-            return Some((user_id.to_owned(), name));
-        }
-        None
+        counterpart_from_members(&value, &session.user_id)
     }
+}
+
+
+fn counterpart_from_joined_members(value: &Value, own_user_id: &str) -> Option<(String, String)> {
+    let joined = value.get("joined")?.as_object()?;
+    for (user_id, member) in joined {
+        if user_id == own_user_id {
+            continue;
+        }
+        let name = member
+            .get("display_name")
+            .or_else(|| member.get("displayname"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| matrix_localpart(user_id));
+        return Some((user_id.to_owned(), name));
+    }
+    None
+}
+
+fn counterpart_from_members(value: &Value, own_user_id: &str) -> Option<(String, String)> {
+    for event in value.get("chunk")?.as_array()? {
+        if event.get("type").and_then(Value::as_str) != Some("m.room.member") {
+            continue;
+        }
+        let Some(user_id) = event.get("state_key").and_then(Value::as_str) else {
+            continue;
+        };
+        if user_id == own_user_id {
+            continue;
+        }
+        let Some(content) = event.get("content") else {
+            continue;
+        };
+        let membership = content.get("membership").and_then(Value::as_str).unwrap_or("");
+        if membership != "join" && membership != "invite" {
+            continue;
+        }
+        let name = content
+            .get("displayname")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| matrix_localpart(user_id));
+        return Some((user_id.to_owned(), name));
+    }
+    None
 }
 
 pub fn member_display_name(
@@ -771,7 +861,7 @@ fn truncate(value: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_token_blob, jwt_expires_at_ms, strip_cookie};
+    use super::{counterpart_from_members, extract_token_blob, jwt_expires_at_ms, strip_cookie};
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
     #[test]
@@ -786,6 +876,42 @@ mod tests {
         let token = extract_token_blob(html).expect("token");
         assert_eq!(token.token, "abc.def.ghi");
         assert_eq!(token.expires.map(|v| v as i64), Some(1_770_000_000_000));
+    }
+
+    #[test]
+    fn detects_invited_counterpart_when_we_started_the_chat() {
+        let members = serde_json::json!({
+            "chunk": [
+                {
+                    "type": "m.room.member",
+                    "state_key": "@me:reddit.com",
+                    "content": {"membership": "join", "displayname": "Me"}
+                },
+                {
+                    "type": "m.room.member",
+                    "state_key": "@them:reddit.com",
+                    "content": {"membership": "invite", "displayname": "pit-test"}
+                }
+            ]
+        });
+        assert_eq!(
+            counterpart_from_members(&members, "@me:reddit.com"),
+            Some(("@them:reddit.com".to_owned(), "pit-test".to_owned()))
+        );
+    }
+
+    #[test]
+    fn ignores_left_users_when_detecting_counterpart() {
+        let members = serde_json::json!({
+            "chunk": [
+                {
+                    "type": "m.room.member",
+                    "state_key": "@old:reddit.com",
+                    "content": {"membership": "leave", "displayname": "old-user"}
+                }
+            ]
+        });
+        assert_eq!(counterpart_from_members(&members, "@me:reddit.com"), None);
     }
 
     #[test]

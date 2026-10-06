@@ -25,6 +25,10 @@ struct Cli {
 enum Command {
     Run,
     Check,
+    ReconcileNames {
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[tokio::main]
@@ -49,5 +53,10 @@ async fn main() -> Result<()> {
     match cli.command.unwrap_or(Command::Run) {
         Command::Run => bridge.run().await,
         Command::Check => bridge.check().await,
+        Command::ReconcileNames { dry_run } => {
+            let report = bridge.reconcile_names(dry_run).await?;
+            println!("{report}");
+            Ok(())
+        }
     }
 }
