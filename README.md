@@ -19,6 +19,7 @@ The target deployment is Linux/Devuan without Rust, Cargo, a system OpenSSL inst
 - generic or stale topic names can be corrected with `/reconcile-names` or `/reconcile_names`; tracked Reddit profile intro posts are updated at the same time
 - successful Reddit -> Telegram delivery advances Reddit-side `m.fully_read`, `m.read`, and `m.read.private` markers
 - replies are bridged in both directions: Reddit represents a reply as a Matrix `m.thread` relation with an `m.in_reply_to` fallback; reddit2tg converts that to a Telegram reply, and Telegram replies are sent back using Reddit's thread relation format
+- Reddit/Matrix deletions are mirrored for bridge-created Telegram copies: `/allow-delete yes` deletes the Telegram copy, while `/allow-delete no` preserves it and hides captured text/images behind Telegram spoiler UI; the setting is stored per Reddit room and defaults to `yes`
 - SQLite keeps durable Matrix event <-> Telegram message mappings and the Telegram message ID of newly created Reddit profile intro posts; one Matrix event may map to multiple Telegram message IDs when long text is split into chunks
 - pre-upgrade messages do not have this mapping automatically; `/reload-history` or `/reset-chat` can seed mappings for replayed history
 
@@ -64,11 +65,17 @@ The default history limit is 50 replayable text/notice/image events and the acce
 
 ### Current limitations
 
-Not implemented yet: reactions, edits/deletes, typing indicators, starting a brand-new Reddit DM from Telegram, or reliable counterparty "seen" receipts. Reddit does not expose dependable remote-user read receipts through the Matrix sync stream, and the Telegram Bot API does not tell a bot when a human has opened a message.
+Not implemented yet: reactions, edits, typing indicators, starting a brand-new Reddit DM from Telegram, or reliable counterparty "seen" receipts. Reddit does not expose dependable remote-user read receipts through the Matrix sync stream, and the Telegram Bot API does not tell a bot when a human has opened a message.
 
 Reddit's upload endpoint accepts images only (JPEG/PNG/WebP up to 20 MiB, GIF up to 100 MiB). The standard Telegram Bot API can download incoming user files only up to 20 MiB and upload at most 10 MiB as a photo or 50 MiB as another file, so larger media cannot be bridged through the hosted Bot API.
 
 History recovery replays text/notice and image events. Historical images use the same Matrix media download and Telegram upload path as live Reddit images, while preserving chronological ordering and reply targets.
+
+### Delete mirroring
+
+Inside a mapped Telegram topic, `/allow-delete yes` (the default) makes a Reddit Matrix `m.room.redaction` delete the directly redacted Telegram copy created by the bridge. `/allow-delete no` preserves the copy and applies spoilers to the redacted message and recursively to bridge-created Telegram copies of every Matrix reply descendant below it. This keeps a deleted parent and its visible reply subtree consistently hidden. `/allow-delete` without an argument reports the current setting.
+
+The bridge intentionally does not modify an operator-authored Telegram source message if Reddit later redacts the Matrix event created from it. Telegram's Bot API only permits `deleteMessage` for messages younger than 48 hours; if deletion of an older bridge-created message fails and a stored snapshot exists, reddit2tg falls back to spoiler preservation. Legacy messages mapped before snapshot support may not be recoverable for that fallback. JPEG/PNG/GIF images can be covered by Telegram media spoilers; Reddit WebP images are converted to PNG on the Telegram side so they have the same behavior. Generic documents/audio do not have equivalent Bot API media-spoiler support, so only their caption can be hidden.
 
 ## Configuration values
 

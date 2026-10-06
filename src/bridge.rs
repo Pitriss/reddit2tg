@@ -14,14 +14,14 @@ use tracing::{error, info, warn};
 
 use crate::{
     config::Config,
-    db::{Db, RoomMap},
+    db::{Db, MessageSnapshot, RoomMap, TelegramDelivery},
     reddit::{
         detect_supported_image_mime, is_auth_refresh_error, matrix_localpart, member_display_name,
         reddit_upload_limit, InvitedRoom, JoinedRoom, MatrixEvent, RedditClient, SendImageRequest,
     },
     telegram::{
         Message, TelegramClient, TELEGRAM_DOWNLOAD_LIMIT, TELEGRAM_FILE_UPLOAD_LIMIT,
-        TELEGRAM_TOPIC_COLORS,
+        TELEGRAM_PHOTO_UPLOAD_LIMIT, TELEGRAM_TOPIC_COLORS,
     },
 };
 
@@ -41,6 +41,12 @@ const MAX_HISTORY_LIMIT: usize = 2000;
 enum HistoryCommandKind {
     Reload,
     Reset,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AllowDeleteCommand {
+    Show,
+    Set(bool),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -621,6 +627,13 @@ impl Bridge {
             if let Some(message_id) = telegram_message_ids.first().copied() {
                 replay_targets.insert(message.event.event_id.clone(), message_id);
             }
+            if let Some(parent_event_id) = message.reply_to_event_id.as_deref() {
+                self.db.record_matrix_reply(
+                    &room.matrix_room_id,
+                    &message.event.event_id,
+                    parent_event_id,
+                )?;
+            }
             self.db.record_matrix_delivery_kind(
                 &room.matrix_room_id,
                 &message.event.event_id,
@@ -628,6 +641,35 @@ impl Bridge {
                 &telegram_message_ids,
                 message_kind,
             )?;
+            if message_kind == "text" {
+                let body = message
+                    .event
+                    .content
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let snapshots =
+                    history_snapshot_texts(message.outgoing, &message.sender_name, &time, body);
+                for (message_id, rendered_text) in
+                    telegram_message_ids.iter().copied().zip(snapshots)
+                {
+                    if let Err(error) = self.db.save_message_snapshot(
+                        &message.event.event_id,
+                        room.telegram_thread_id,
+                        message_id,
+                        Some(&rendered_text),
+                        None,
+                        None,
+                    ) {
+                        warn!(
+                            error = %error,
+                            matrix_event_id = %message.event.event_id,
+                            telegram_message_id = message_id,
+                            "Telegram history text snapshot could not be persisted"
+                        );
+                    }
+                }
+            }
         }
         info!(
             matrix_room_id = %room.matrix_room_id,
@@ -763,6 +805,42 @@ impl Bridge {
 
             if let Some(message_id) = telegram_message_ids.first().copied() {
                 replay_targets.insert(message.event.event_id.clone(), message_id);
+            }
+            if let Some(parent_event_id) = message.reply_to_event_id.as_deref() {
+                self.db.record_matrix_reply(
+                    &room.matrix_room_id,
+                    &message.event.event_id,
+                    parent_event_id,
+                )?;
+            }
+            if message_kind == "text" {
+                let body = message
+                    .event
+                    .content
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let snapshots =
+                    history_snapshot_texts(message.outgoing, &message.sender_name, &time, body);
+                for (message_id, rendered_text) in
+                    telegram_message_ids.iter().copied().zip(snapshots)
+                {
+                    if let Err(error) = self.db.save_message_snapshot(
+                        &message.event.event_id,
+                        new_thread_id,
+                        message_id,
+                        Some(&rendered_text),
+                        None,
+                        None,
+                    ) {
+                        warn!(
+                            error = %error,
+                            matrix_event_id = %message.event.event_id,
+                            telegram_message_id = message_id,
+                            "Telegram reset-history text snapshot could not be persisted"
+                        );
+                    }
+                }
             }
             for (part_index, message_id) in telegram_message_ids.into_iter().enumerate() {
                 deliveries.push((
@@ -1040,6 +1118,289 @@ impl Bridge {
         Ok(())
     }
 
+    async fn spoiler_matrix_delivery(
+        &self,
+        delivery: &TelegramDelivery,
+        snapshot: Option<&MessageSnapshot>,
+    ) -> Result<bool> {
+        let Some(snapshot) = snapshot else {
+            return Ok(false);
+        };
+
+        if delivery.message_kind == "text" {
+            let Some(original) = snapshot.rendered_text.as_deref() else {
+                return Ok(false);
+            };
+            match self
+                .telegram
+                .spoiler_text_message(delivery.message_id, original)
+                .await
+            {
+                Ok(()) => return Ok(true),
+                Err(error) if telegram_idempotent_error(&error) => return Ok(true),
+                Err(error) => return Err(error),
+            }
+        }
+
+        if let (Some(media_file_id), Some(media_type)) = (
+            snapshot.media_file_id.as_deref(),
+            snapshot.media_type.as_deref(),
+        ) {
+            if media_type == "document" && delivery.message_kind == "image" {
+                match self.telegram.download_file(media_file_id).await {
+                    Ok(data) => {
+                        if let Some(detected_mime) = detect_supported_image_mime(&data) {
+                            let mut upload_data = data;
+                            let mut upload_mime = detected_mime.to_owned();
+
+                            if upload_mime == "image/webp" {
+                                let decoded = image::load_from_memory_with_format(
+                                    &upload_data,
+                                    ImageFormat::WebP,
+                                )
+                                .context(
+                                    "decode Telegram WebP document before spoiler conversion",
+                                )?;
+                                let mut png = Vec::new();
+                                decoded
+                                    .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+                                    .context("convert Telegram WebP document to PNG for spoiler")?;
+                                upload_data = png;
+                                upload_mime = "image/png".to_owned();
+                            }
+
+                            let uploadable = match upload_mime.as_str() {
+                                "image/jpeg" | "image/png" => {
+                                    upload_data.len() <= TELEGRAM_PHOTO_UPLOAD_LIMIT
+                                }
+                                "image/gif" => upload_data.len() <= TELEGRAM_FILE_UPLOAD_LIMIT,
+                                _ => false,
+                            };
+
+                            if uploadable {
+                                match self
+                                    .telegram
+                                    .spoiler_uploaded_image_message(
+                                        delivery.message_id,
+                                        &upload_data,
+                                        &upload_mime,
+                                        snapshot.rendered_text.as_deref(),
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => return Ok(true),
+                                    Err(error) if telegram_idempotent_error(&error) => {
+                                        return Ok(true);
+                                    }
+                                    Err(error) => return Err(error),
+                                }
+                            }
+
+                            warn!(
+                                telegram_message_id = delivery.message_id,
+                                mime_type = %upload_mime,
+                                bytes = upload_data.len(),
+                                "Telegram image document is too large or unsupported for media-spoiler conversion"
+                            );
+                        } else {
+                            warn!(
+                                telegram_message_id = delivery.message_id,
+                                "Telegram image document is not a supported JPEG/PNG/GIF/WebP image"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        warn!(
+                            error = %error,
+                            telegram_message_id = delivery.message_id,
+                            "Telegram image document could not be downloaded for media-spoiler conversion"
+                        );
+                    }
+                }
+            } else {
+                return match self
+                    .telegram
+                    .spoiler_media_message(
+                        delivery.message_id,
+                        media_type,
+                        media_file_id,
+                        snapshot.rendered_text.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(fully_hidden) => Ok(fully_hidden),
+                    Err(error) if telegram_idempotent_error(&error) => Ok(true),
+                    Err(error) => Err(error),
+                };
+            }
+        }
+
+        if snapshot.rendered_text.is_some() {
+            return match self
+                .telegram
+                .spoiler_caption_message(delivery.message_id, snapshot.rendered_text.as_deref())
+                .await
+            {
+                Ok(()) => Ok(false),
+                Err(error) if telegram_idempotent_error(&error) => Ok(false),
+                Err(error) => Err(error),
+            };
+        }
+
+        Ok(false)
+    }
+
+    async fn process_matrix_redaction(
+        &self,
+        room_id: &str,
+        mapping: &RoomMap,
+        event: &MatrixEvent,
+    ) -> Result<()> {
+        let Some(target_event_id) = event.redacts.as_deref().filter(|value| !value.is_empty())
+        else {
+            self.db.mark_matrix_event_seen(&event.event_id, room_id)?;
+            warn!(
+                matrix_room_id = %room_id,
+                matrix_event_id = %event.event_id,
+                "Matrix redaction has no target event id"
+            );
+            return Ok(());
+        };
+
+        let allow_delete = self.db.allow_delete(room_id)?;
+        let affected_event_ids = if allow_delete {
+            vec![target_event_id.to_owned()]
+        } else {
+            self.db.matrix_reply_subtree(room_id, target_event_id)?
+        };
+
+        info!(
+            matrix_room_id = %room_id,
+            matrix_redaction_event_id = %event.event_id,
+            redacted_matrix_event_id = %target_event_id,
+            allow_delete,
+            affected_events = affected_event_ids.len(),
+            "processing Reddit redaction"
+        );
+
+        let mut mapped_copies = 0usize;
+
+        for affected_event_id in &affected_event_ids {
+            let deliveries = self
+                .db
+                .telegram_deliveries_for_matrix(affected_event_id, mapping.telegram_thread_id)?;
+
+            for delivery in deliveries {
+                if delivery.direction != "matrix_to_telegram" {
+                    info!(
+                        matrix_room_id = %room_id,
+                        matrix_event_id = %affected_event_id,
+                        telegram_message_id = delivery.message_id,
+                        "reply-subtree member originated in Telegram; operator source message is left unchanged"
+                    );
+                    continue;
+                }
+
+                mapped_copies += 1;
+                let snapshot = self.db.message_snapshot(
+                    affected_event_id,
+                    mapping.telegram_thread_id,
+                    delivery.message_id,
+                )?;
+
+                if allow_delete {
+                    match self.telegram.delete_message(delivery.message_id).await {
+                        Ok(()) => {
+                            info!(
+                                matrix_room_id = %room_id,
+                                redacted_matrix_event_id = %target_event_id,
+                                telegram_message_id = delivery.message_id,
+                                "Telegram copy deleted after Reddit redaction"
+                            );
+                            continue;
+                        }
+                        Err(error) if telegram_delete_already_done(&error) => continue,
+                        Err(delete_error) => {
+                            match self
+                                .spoiler_matrix_delivery(&delivery, snapshot.as_ref())
+                                .await
+                            {
+                                Ok(true) => {
+                                    warn!(
+                                        error = %delete_error,
+                                        matrix_room_id = %room_id,
+                                        redacted_matrix_event_id = %target_event_id,
+                                        telegram_message_id = delivery.message_id,
+                                        "Telegram deletion failed; preserved copy was hidden behind spoiler"
+                                    );
+                                    continue;
+                                }
+                                Ok(false) => {
+                                    warn!(
+                                        error = %delete_error,
+                                        matrix_room_id = %room_id,
+                                        redacted_matrix_event_id = %target_event_id,
+                                        telegram_message_id = delivery.message_id,
+                                        "Telegram deletion failed and no complete spoiler fallback was available"
+                                    );
+                                    continue;
+                                }
+                                Err(spoiler_error) => {
+                                    return Err(spoiler_error).with_context(|| {
+                                        format!(
+                                            "delete Telegram message {} failed ({delete_error}); spoiler fallback failed",
+                                            delivery.message_id
+                                        )
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+
+                match self
+                    .spoiler_matrix_delivery(&delivery, snapshot.as_ref())
+                    .await
+                {
+                    Ok(true) => {
+                        info!(
+                            matrix_room_id = %room_id,
+                            redacted_matrix_event_id = %target_event_id,
+                            affected_matrix_event_id = %affected_event_id,
+                            telegram_message_id = delivery.message_id,
+                            "Telegram reply-subtree copy hidden behind spoiler after Reddit redaction"
+                        );
+                    }
+                    Ok(false) => {
+                        warn!(
+                            matrix_room_id = %room_id,
+                            redacted_matrix_event_id = %target_event_id,
+                            affected_matrix_event_id = %affected_event_id,
+                            telegram_message_id = delivery.message_id,
+                            message_kind = %delivery.message_kind,
+                            part_index = delivery.part_index,
+                            "Reddit redaction could not fully hide this legacy/unsupported Telegram copy"
+                        );
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+
+        if mapped_copies == 0 {
+            info!(
+                matrix_room_id = %room_id,
+                matrix_redaction_event_id = %event.event_id,
+                redacted_matrix_event_id = %target_event_id,
+                allow_delete,
+                "Reddit redaction/reply subtree has no bridge-created Telegram copies"
+            );
+        }
+
+        self.db.mark_matrix_event_seen(&event.event_id, room_id)?;
+        Ok(())
+    }
+
     async fn process_joined_room(&self, room_id: &str, room: JoinedRoom) -> Result<()> {
         let own = self
             .reddit
@@ -1084,9 +1445,6 @@ impl Bridge {
                 .iter()
                 .any(|event| event.event_type == "m.room.message" && event.sender == own)
         {
-            // Reddit may expose the invite membership a fraction later than
-            // the first locally-sent event. Give it two short chances so an
-            // outgoing-first conversation gets a human topic name immediately.
             for delay_ms in [150u64, 400u64] {
                 sleep(Duration::from_millis(delay_ms)).await;
                 counterpart = self
@@ -1124,25 +1482,40 @@ impl Bridge {
             .await;
 
         for event in room.timeline.events {
-            if event.event_type != "m.room.message" || event.event_id.is_empty() {
+            if event.event_id.is_empty() {
                 continue;
             }
             if self.db.matrix_event_seen(&event.event_id)? {
                 continue;
             }
+
+            if event.event_type == "m.room.redaction" {
+                self.process_matrix_redaction(room_id, &mapping, &event)
+                    .await?;
+                continue;
+            }
+            if event.event_type != "m.room.message" {
+                continue;
+            }
+
             let msgtype = event
                 .content
                 .get("msgtype")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            let reply_to_message_id =
-                if let Some(reply_event_id) = matrix_reply_target(&event.content) {
-                    self.db
-                        .telegram_message_for_matrix(&reply_event_id, mapping.telegram_thread_id)?
-                } else {
-                    None
-                };
+            let reply_event_id = matrix_reply_target(&event.content);
+            if let Some(parent_event_id) = reply_event_id.as_deref() {
+                self.db
+                    .record_matrix_reply(room_id, &event.event_id, parent_event_id)?;
+            }
+            let reply_to_message_id = if let Some(reply_event_id) = reply_event_id.as_deref() {
+                self.db
+                    .telegram_message_for_matrix(reply_event_id, mapping.telegram_thread_id)?
+            } else {
+                None
+            };
 
+            let mut text_snapshots = Vec::new();
             let (telegram_message_ids, message_kind) = match msgtype {
                 "m.text" | "m.notice" => {
                     let Some(body) = event.content.get("body").and_then(Value::as_str) else {
@@ -1154,16 +1527,17 @@ impl Bridge {
                     } else {
                         body.to_owned()
                     };
-                    (
-                        self.telegram
-                            .send_text_with_reply(
-                                mapping.telegram_thread_id,
-                                &rendered,
-                                reply_to_message_id,
-                            )
-                            .await?,
-                        "text",
-                    )
+                    let sent = self
+                        .telegram
+                        .send_text_with_reply_detailed(
+                            mapping.telegram_thread_id,
+                            &rendered,
+                            reply_to_message_id,
+                        )
+                        .await?;
+                    let ids = sent.iter().map(|message| message.message_id).collect();
+                    text_snapshots = sent;
+                    (ids, "text")
                 }
                 "m.image" | "m.file" | "m.video" | "m.audio" => (
                     self.forward_matrix_media(
@@ -1184,6 +1558,25 @@ impl Bridge {
                 &telegram_message_ids,
                 message_kind,
             )?;
+
+            for snapshot in text_snapshots {
+                if let Err(error) = self.db.save_message_snapshot(
+                    &event.event_id,
+                    mapping.telegram_thread_id,
+                    snapshot.message_id,
+                    snapshot.rendered_text.as_deref(),
+                    snapshot.media_file_id.as_deref(),
+                    snapshot.media_type.as_deref(),
+                ) {
+                    warn!(
+                        error = %error,
+                        matrix_event_id = %event.event_id,
+                        telegram_message_id = snapshot.message_id,
+                        "Telegram text snapshot could not be persisted"
+                    );
+                }
+            }
+
             if event.sender != own {
                 self.db.queue_read_receipt(room_id, &event.event_id)?;
                 self.flush_read_receipt(room_id, &event.event_id).await?;
@@ -1283,38 +1676,73 @@ impl Bridge {
             .and_then(|info| info.get("mimetype"))
             .and_then(Value::as_str)
             .map(normalize_mime);
-        let mime_type = declared_mime
-            .filter(|mime| !mime.is_empty())
-            .unwrap_or_else(|| normalize_mime(&downloaded_mime));
-        let mime_type = if mime_type.is_empty() {
-            "application/octet-stream"
+        let detected_image_mime = if msgtype == "m.image" {
+            detect_supported_image_mime(&data)
         } else {
-            mime_type
+            None
         };
-        let file_name = media_file_name(body, mime_type, msgtype);
+        let mime_type = detected_image_mime
+            .or_else(|| declared_mime.filter(|mime| !mime.is_empty()))
+            .unwrap_or_else(|| normalize_mime(&downloaded_mime));
+        let mut upload_mime = if mime_type.is_empty() {
+            "application/octet-stream".to_owned()
+        } else {
+            mime_type.to_owned()
+        };
+        let mut upload_data = data;
+        let mut file_name = media_file_name(body, &upload_mime, msgtype);
+
+        if msgtype == "m.image" && upload_mime == "image/webp" {
+            let decoded = image::load_from_memory_with_format(&upload_data, ImageFormat::WebP)
+                .context("decode Reddit WebP before Telegram upload")?;
+            let mut png = Vec::new();
+            decoded
+                .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+                .context("convert Reddit WebP to PNG for Telegram")?;
+            upload_data = png;
+            upload_mime = "image/png".to_owned();
+            file_name = "image.png".to_owned();
+        }
+
         let event_caption =
             (!body.trim().is_empty() && body != "Image" && body != file_name).then_some(body);
         let prefixed_caption = caption_prefix.map(|prefix| match event_caption {
-            Some(event_caption) => format!(
-                "{prefix}
-{event_caption}"
-            ),
+            Some(event_caption) => format!("{prefix}\n{event_caption}"),
             None => prefix.to_owned(),
         });
         let caption = prefixed_caption.as_deref().or(event_caption);
 
-        let message_id = self
+        let sent = self
             .telegram
-            .send_media_with_reply(
+            .send_media_with_reply_detailed(
                 thread_id,
-                &data,
+                &upload_data,
                 &file_name,
-                mime_type,
+                &upload_mime,
                 caption,
                 reply_to_message_id,
             )
             .await?;
-        Ok(vec![message_id])
+
+        if !event.event_id.is_empty() {
+            if let Err(error) = self.db.save_message_snapshot(
+                &event.event_id,
+                thread_id,
+                sent.message_id,
+                sent.rendered_text.as_deref(),
+                sent.media_file_id.as_deref(),
+                sent.media_type.as_deref(),
+            ) {
+                warn!(
+                    error = %error,
+                    matrix_event_id = %event.event_id,
+                    telegram_message_id = sent.message_id,
+                    "Telegram media snapshot could not be persisted"
+                );
+            }
+        }
+
+        Ok(vec![sent.message_id])
     }
 
     async fn flush_pending_read_receipts(&self) -> Result<()> {
@@ -1604,6 +2032,10 @@ impl Bridge {
                 refresh_before_secs: self.cfg.bridge.refresh_before_secs,
             })
             .await?;
+        if let Some(parent_event_id) = reply_to_event_id.as_deref() {
+            self.db
+                .record_matrix_reply(&room.matrix_room_id, &event_id, parent_event_id)?;
+        }
         self.db.record_telegram_delivery_kind(
             &room.matrix_room_id,
             &event_id,
@@ -1790,6 +2222,62 @@ impl Bridge {
             return Ok(());
         }
 
+        if let Some(command) = parse_allow_delete_command(text) {
+            let Some(thread_id) = message.message_thread_id else {
+                self.telegram
+                    .send_general(
+                        "/allow-delete musí být spuštěn uvnitř mapovaného Telegram topicu.",
+                    )
+                    .await?;
+                return Ok(());
+            };
+            let Some(room) = self.db.room_by_thread(thread_id)? else {
+                self.telegram
+                    .send_text(
+                        thread_id,
+                        "Tento Telegram topic není mapovaný na Reddit chat.",
+                    )
+                    .await?;
+                return Ok(());
+            };
+
+            match command {
+                Ok(AllowDeleteCommand::Show) => {
+                    let allow_delete = self.db.allow_delete(&room.matrix_room_id)?;
+                    self.telegram
+                        .send_text(
+                            thread_id,
+                            if allow_delete {
+                                "allow-delete: yes — smazání na Redditu smaže bridgovanou kopii v Telegramu."
+                            } else {
+                                "allow-delete: no — smazání na Redditu ponechá bridgovanou kopii a zakryje její obsah spoilerem."
+                            },
+                        )
+                        .await?;
+                }
+                Ok(AllowDeleteCommand::Set(allow_delete)) => {
+                    self.db
+                        .set_allow_delete(&room.matrix_room_id, allow_delete)?;
+                    self.telegram
+                        .send_text(
+                            thread_id,
+                            if allow_delete {
+                                "allow-delete nastaveno na yes."
+                            } else {
+                                "allow-delete nastaveno na no."
+                            },
+                        )
+                        .await?;
+                }
+                Err(()) => {
+                    self.telegram
+                        .send_text(thread_id, "Použití: /allow-delete yes|no")
+                        .await?;
+                }
+            }
+            return Ok(());
+        }
+
         if let Some(command) = parse_history_command(text) {
             let command = match command {
                 Ok(command) => command,
@@ -1962,6 +2450,10 @@ impl Bridge {
                 self.cfg.bridge.refresh_before_secs,
             )
             .await?;
+        if let Some(parent_event_id) = reply_to_event_id.as_deref() {
+            self.db
+                .record_matrix_reply(&room.matrix_room_id, &event_id, parent_event_id)?;
+        }
         info!(
             telegram_thread_id = thread_id,
             matrix_room_id = %room.matrix_room_id,
@@ -2031,6 +2523,7 @@ fn topic_help_text(status: Option<&str>) -> &'static str {
 /help — zobrazí tuto nápovědu\n\
 /reload-history [1-2000] [dry-run] — znovu nahraje historii do tohoto topicu\n\
 /reset-chat [1-2000] [dry-run] — vytvoří nový topic a přehraje do něj historii\n\
+/allow-delete yes|no — určí, zda Reddit delete smaže Telegram kopii, nebo ji zakryje spoilerem\n\
 \n\
 Běžný text se odešle na Reddit.\n\
 Podporované obrázky: JPEG, PNG, GIF a WebP.\n\
@@ -2068,6 +2561,22 @@ fn parse_reconcile_names_command(input: &str) -> Option<std::result::Result<bool
     match (parts.next(), parts.next()) {
         (None, None) => Some(Ok(false)),
         (Some("dry-run" | "--dry-run"), None) => Some(Ok(true)),
+        _ => Some(Err(())),
+    }
+}
+
+fn parse_allow_delete_command(input: &str) -> Option<std::result::Result<AllowDeleteCommand, ()>> {
+    let mut parts = input.split_whitespace();
+    let first = parts.next()?;
+    let command = first.split('@').next().unwrap_or(first);
+    if command != "/allow-delete" && command != "/allow_delete" {
+        return None;
+    }
+
+    match (parts.next(), parts.next()) {
+        (None, None) => Some(Ok(AllowDeleteCommand::Show)),
+        (Some("yes"), None) => Some(Ok(AllowDeleteCommand::Set(true))),
+        (Some("no"), None) => Some(Ok(AllowDeleteCommand::Set(false))),
         _ => Some(Err(())),
     }
 }
@@ -2211,6 +2720,45 @@ fn topic_color_from_avatar(image: &RgbaImage) -> u32 {
     TELEGRAM_TOPIC_COLORS[index]
 }
 
+fn history_snapshot_texts(
+    outgoing: bool,
+    sender_name: &str,
+    time: &str,
+    body: &str,
+) -> Vec<String> {
+    let direction = if outgoing { ">>" } else { "<<" };
+    let header: String = format!("[{time}] {direction} {sender_name}:")
+        .chars()
+        .take(200)
+        .collect();
+    split_snapshot_text(body, 3500)
+        .into_iter()
+        .map(|chunk| format!("{header}\n{chunk}"))
+        .collect()
+}
+
+fn split_snapshot_text(input: &str, max_chars: usize) -> Vec<String> {
+    if input.is_empty() || max_chars == 0 {
+        return vec![String::new()];
+    }
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut count = 0usize;
+    for ch in input.chars() {
+        if count == max_chars {
+            chunks.push(current);
+            current = String::new();
+            count = 0;
+        }
+        current.push(ch);
+        count += 1;
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
 fn history_timestamp(origin_server_ts: i64) -> (String, String) {
     let utc = DateTime::<Utc>::from_timestamp_millis(origin_server_ts).unwrap_or_else(|| {
         DateTime::<Utc>::from_timestamp(0, 0).expect("Unix epoch must be valid")
@@ -2280,6 +2828,17 @@ fn matrix_reply_target(content: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn telegram_idempotent_error(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_ascii_lowercase();
+    text.contains("message is not modified")
+}
+
+fn telegram_delete_already_done(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_ascii_lowercase();
+    text.contains("message to delete not found")
+        || text.contains("message identifier is not specified")
+}
+
 fn startup_event_should_forward(origin_server_ts: i64, cutoff_ms: i64) -> bool {
     origin_server_ts >= cutoff_ms
 }
@@ -2301,9 +2860,10 @@ fn unix_ms() -> i64 {
 mod tests {
     use super::{
         fallback_topic_color, general_help_text, history_timestamp, matrix_reply_target,
-        parse_help_command, parse_history_command, parse_reconcile_names_command,
-        profile_intro_text, startup_event_should_forward, topic_color_from_avatar, topic_help_text,
-        HistoryCommand, HistoryCommandKind, DEFAULT_HISTORY_LIMIT,
+        parse_allow_delete_command, parse_help_command, parse_history_command,
+        parse_reconcile_names_command, profile_intro_text, startup_event_should_forward,
+        topic_color_from_avatar, topic_help_text, AllowDeleteCommand, HistoryCommand,
+        HistoryCommandKind, DEFAULT_HISTORY_LIMIT,
     };
     use crate::telegram::TELEGRAM_TOPIC_COLORS;
     use image::{Rgba, RgbaImage};
@@ -2347,6 +2907,7 @@ mod tests {
         let joined = topic_help_text(Some("joined"));
         assert!(joined.contains("/reload-history [1-2000]"));
         assert!(joined.contains("/reset-chat [1-2000]"));
+        assert!(joined.contains("/allow-delete yes|no"));
         assert!(!joined.contains("/accept"));
 
         assert!(topic_help_text(None).contains("není mapovaný"));
@@ -2453,6 +3014,27 @@ mod tests {
             Some(Err(()))
         );
         assert_eq!(parse_reconcile_names_command("hello"), None);
+    }
+
+    #[test]
+    fn allow_delete_command_accepts_yes_no_and_query() {
+        assert_eq!(
+            parse_allow_delete_command("/allow-delete"),
+            Some(Ok(AllowDeleteCommand::Show))
+        );
+        assert_eq!(
+            parse_allow_delete_command("/allow-delete yes"),
+            Some(Ok(AllowDeleteCommand::Set(true)))
+        );
+        assert_eq!(
+            parse_allow_delete_command("/allow_delete@reddit2tg_bot no"),
+            Some(Ok(AllowDeleteCommand::Set(false)))
+        );
+        assert_eq!(
+            parse_allow_delete_command("/allow-delete maybe"),
+            Some(Err(()))
+        );
+        assert_eq!(parse_allow_delete_command("hello"), None);
     }
 
     #[test]

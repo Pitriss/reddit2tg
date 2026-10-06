@@ -104,6 +104,14 @@ pub struct TelegramImageAttachment {
     pub caption: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SentTelegramMessage {
+    pub message_id: i64,
+    pub rendered_text: Option<String>,
+    pub media_file_id: Option<String>,
+    pub media_type: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct TelegramFile {
     file_path: Option<String>,
@@ -361,7 +369,21 @@ impl TelegramClient {
         text: &str,
         reply_to_message_id: Option<i64>,
     ) -> Result<Vec<i64>> {
-        let mut message_ids = Vec::new();
+        Ok(self
+            .send_text_with_reply_detailed(thread_id, text, reply_to_message_id)
+            .await?
+            .into_iter()
+            .map(|message| message.message_id)
+            .collect())
+    }
+
+    pub async fn send_text_with_reply_detailed(
+        &self,
+        thread_id: i64,
+        text: &str,
+        reply_to_message_id: Option<i64>,
+    ) -> Result<Vec<SentTelegramMessage>> {
+        let mut messages = Vec::new();
         for (part_index, chunk) in split_text(text, 4000).into_iter().enumerate() {
             let mut body = serde_json::json!({
                 "chat_id": self.chat_id,
@@ -386,9 +408,14 @@ impl TelegramClient {
                     "Telegram sendMessage returned a different or missing message_thread_id"
                 );
             }
-            message_ids.push(sent.message_id);
+            messages.push(SentTelegramMessage {
+                message_id: sent.message_id,
+                rendered_text: Some(chunk),
+                media_file_id: None,
+                media_type: None,
+            });
         }
-        Ok(message_ids)
+        Ok(messages)
     }
 
     pub async fn send_history_date_separator(&self, thread_id: i64, date: &str) -> Result<()> {
@@ -541,6 +568,28 @@ impl TelegramClient {
         caption: Option<&str>,
         reply_to_message_id: Option<i64>,
     ) -> Result<i64> {
+        Ok(self
+            .send_media_with_reply_detailed(
+                thread_id,
+                data,
+                file_name,
+                mime_type,
+                caption,
+                reply_to_message_id,
+            )
+            .await?
+            .message_id)
+    }
+
+    pub async fn send_media_with_reply_detailed(
+        &self,
+        thread_id: i64,
+        data: &[u8],
+        file_name: &str,
+        mime_type: &str,
+        caption: Option<&str>,
+        reply_to_message_id: Option<i64>,
+    ) -> Result<SentTelegramMessage> {
         if data.len() > TELEGRAM_FILE_UPLOAD_LIMIT {
             bail!(
                 "media exceeds Telegram Bot API upload limit of {} bytes",
@@ -558,6 +607,11 @@ impl TelegramClient {
             ("sendDocument", "document")
         };
 
+        let caption = caption
+            .map(str::trim)
+            .filter(|caption| !caption.is_empty() && *caption != "Image")
+            .map(|caption| caption.chars().take(1000).collect::<String>());
+
         let url = format!("{}/{}", self.base, method);
         const MAX_RATE_LIMIT_RETRIES: usize = 5;
         for retry in 0..=MAX_RATE_LIMIT_RETRIES {
@@ -569,11 +623,8 @@ impl TelegramClient {
                 .text("chat_id", self.chat_id.to_string())
                 .text("message_thread_id", thread_id.to_string())
                 .part(field_name.to_owned(), part);
-            if let Some(caption) = caption
-                .map(str::trim)
-                .filter(|caption| !caption.is_empty() && *caption != "Image")
-            {
-                form = form.text("caption", caption.chars().take(1000).collect::<String>());
+            if let Some(caption) = caption.as_deref() {
+                form = form.text("caption", caption.to_owned());
             }
             if let Some(reply_to_message_id) = reply_to_message_id {
                 form = form.text(
@@ -601,7 +652,13 @@ impl TelegramClient {
                 let message = parsed.result.ok_or_else(|| {
                     anyhow::anyhow!("Telegram {method} returned ok without result")
                 })?;
-                return Ok(message.message_id);
+                let (media_file_id, media_type) = message_media_identity(&message);
+                return Ok(SentTelegramMessage {
+                    message_id: message.message_id,
+                    rendered_text: caption.clone(),
+                    media_file_id,
+                    media_type,
+                });
             }
 
             if let Some(retry_after) = parsed
@@ -625,6 +682,181 @@ impl TelegramClient {
 
             bail!(
                 "Telegram {method} failed (HTTP {status}): {}",
+                parsed
+                    .description
+                    .unwrap_or_else(|| "unknown error".to_owned())
+            );
+        }
+
+        unreachable!()
+    }
+
+    pub async fn delete_message(&self, message_id: i64) -> Result<()> {
+        let _: bool = self
+            .call(
+                "deleteMessage",
+                &serde_json::json!({
+                    "chat_id": self.chat_id,
+                    "message_id": message_id,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn spoiler_text_message(&self, message_id: i64, original: &str) -> Result<()> {
+        let (text, entities) = deleted_spoiler_text(Some(original), 4096);
+        let _: Message = self
+            .call(
+                "editMessageText",
+                &serde_json::json!({
+                    "chat_id": self.chat_id,
+                    "message_id": message_id,
+                    "text": text,
+                    "entities": entities,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn spoiler_caption_message(
+        &self,
+        message_id: i64,
+        original: Option<&str>,
+    ) -> Result<()> {
+        let (caption, caption_entities) = deleted_spoiler_text(original, 1024);
+        let _: Message = self
+            .call(
+                "editMessageCaption",
+                &serde_json::json!({
+                    "chat_id": self.chat_id,
+                    "message_id": message_id,
+                    "caption": caption,
+                    "caption_entities": caption_entities,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn spoiler_media_message(
+        &self,
+        message_id: i64,
+        media_type: &str,
+        media_file_id: &str,
+        original_caption: Option<&str>,
+    ) -> Result<bool> {
+        if matches!(media_type, "photo" | "animation" | "video") {
+            let (caption, caption_entities) = deleted_spoiler_text(original_caption, 1024);
+            let media = serde_json::json!({
+                "type": media_type,
+                "media": media_file_id,
+                "caption": caption,
+                "caption_entities": caption_entities,
+                "has_spoiler": true,
+            });
+            let _: Message = self
+                .call(
+                    "editMessageMedia",
+                    &serde_json::json!({
+                        "chat_id": self.chat_id,
+                        "message_id": message_id,
+                        "media": media,
+                    }),
+                )
+                .await?;
+            return Ok(true);
+        }
+
+        self.spoiler_caption_message(message_id, original_caption)
+            .await?;
+        Ok(false)
+    }
+
+    pub async fn spoiler_uploaded_image_message(
+        &self,
+        message_id: i64,
+        data: &[u8],
+        mime_type: &str,
+        original_caption: Option<&str>,
+    ) -> Result<()> {
+        let (input_type, file_name) = match mime_type {
+            "image/jpeg" if data.len() <= TELEGRAM_PHOTO_UPLOAD_LIMIT => {
+                ("photo", "deleted-image.jpg")
+            }
+            "image/png" if data.len() <= TELEGRAM_PHOTO_UPLOAD_LIMIT => {
+                ("photo", "deleted-image.png")
+            }
+            "image/gif" if data.len() <= TELEGRAM_FILE_UPLOAD_LIMIT => {
+                ("animation", "deleted-image.gif")
+            }
+            _ => bail!(
+                "image cannot be converted to Telegram spoiler media: mime={mime_type}, bytes={}",
+                data.len()
+            ),
+        };
+
+        let (caption, caption_entities) = deleted_spoiler_text(original_caption, 1024);
+        let media = serde_json::json!({
+            "type": input_type,
+            "media": "attach://replacement",
+            "caption": caption,
+            "caption_entities": caption_entities,
+            "has_spoiler": true,
+        });
+
+        let url = format!("{}/editMessageMedia", self.base);
+        const MAX_RATE_LIMIT_RETRIES: usize = 5;
+        for retry in 0..=MAX_RATE_LIMIT_RETRIES {
+            let part = Part::bytes(data.to_vec())
+                .file_name(file_name.to_owned())
+                .mime_str(mime_type)
+                .with_context(|| format!("invalid replacement image MIME type {mime_type}"))?;
+            let form = Form::new()
+                .text("chat_id", self.chat_id.to_string())
+                .text("message_id", message_id.to_string())
+                .text("media", media.to_string())
+                .part("replacement", part);
+
+            let response = self
+                .http
+                .post(&url)
+                .multipart(form)
+                .send()
+                .await
+                .context("Telegram editMessageMedia spoiler-image request failed")?;
+            let status = response.status();
+            let parsed: ApiResponse<Message> = response.json().await.with_context(|| {
+                format!(
+                    "Telegram editMessageMedia spoiler-image returned invalid JSON (HTTP {status})"
+                )
+            })?;
+
+            if parsed.ok {
+                return Ok(());
+            }
+
+            if let Some(retry_after) = parsed
+                .parameters
+                .as_ref()
+                .and_then(|parameters| parameters.retry_after)
+            {
+                if retry < MAX_RATE_LIMIT_RETRIES {
+                    let wait_secs = retry_after.saturating_add(1);
+                    tracing::warn!(
+                        retry_after_secs = retry_after,
+                        wait_secs,
+                        retry = retry + 1,
+                        "Telegram flood control while converting image document to spoiler media"
+                    );
+                    tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+                    continue;
+                }
+            }
+
+            bail!(
+                "Telegram editMessageMedia spoiler-image failed (HTTP {status}): {}",
                 parsed
                     .description
                     .unwrap_or_else(|| "unknown error".to_owned())
@@ -712,6 +944,56 @@ impl TelegramClient {
 
         unreachable!()
     }
+}
+
+fn message_media_identity(message: &Message) -> (Option<String>, Option<String>) {
+    if let Some(photo) = message.photo.as_ref().and_then(|sizes| {
+        sizes
+            .iter()
+            .max_by_key(|item| item.width.saturating_mul(item.height))
+    }) {
+        return (Some(photo.file_id.clone()), Some("photo".to_owned()));
+    }
+    if let Some(animation) = message.animation.as_ref() {
+        return (
+            Some(animation.file_id.clone()),
+            Some("animation".to_owned()),
+        );
+    }
+    if let Some(document) = message.document.as_ref() {
+        return (Some(document.file_id.clone()), Some("document".to_owned()));
+    }
+    if let Some(video) = message.video.as_ref() {
+        if let Some(file_id) = video.get("file_id").and_then(Value::as_str) {
+            return (Some(file_id.to_owned()), Some("video".to_owned()));
+        }
+    }
+    if let Some(audio) = message.audio.as_ref() {
+        if let Some(file_id) = audio.get("file_id").and_then(Value::as_str) {
+            return (Some(file_id.to_owned()), Some("audio".to_owned()));
+        }
+    }
+    (None, None)
+}
+
+fn deleted_spoiler_text(original: Option<&str>, max_chars: usize) -> (String, Vec<Value>) {
+    let prefix = "Smazáno na Redditu\n";
+    let prefix_chars = prefix.chars().count();
+    let hidden = original
+        .unwrap_or("")
+        .chars()
+        .take(max_chars.saturating_sub(prefix_chars))
+        .collect::<String>();
+    let text = format!("{prefix}{hidden}");
+    let mut entities = Vec::new();
+    if !hidden.is_empty() {
+        entities.push(serde_json::json!({
+            "type": "spoiler",
+            "offset": prefix.encode_utf16().count(),
+            "length": hidden.encode_utf16().count(),
+        }));
+    }
+    (text, entities)
 }
 
 fn looks_like_image_name(file_name: &str) -> bool {

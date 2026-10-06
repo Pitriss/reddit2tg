@@ -139,6 +139,8 @@ pub struct MatrixEvent {
     #[serde(default)]
     pub state_key: Option<String>,
     #[serde(default)]
+    pub redacts: Option<String>,
+    #[serde(default)]
     pub content: Value,
 }
 
@@ -497,7 +499,7 @@ impl RedditClient {
             let session = self.ensure_session(refresh_before_secs).await?;
             let url = format!("{}/_matrix/client/v3/sync", self.homeserver);
             let filter = if since.is_none() {
-                r#"{"room":{"timeline":{"limit":100,"types":["m.room.message"],"lazy_load_members":true},"state":{"lazy_load_members":true}}}"#
+                r#"{"room":{"timeline":{"limit":100,"types":["m.room.message","m.room.redaction"],"lazy_load_members":true},"state":{"lazy_load_members":true}}}"#
             } else {
                 r#"{"room":{"timeline":{"unread_thread_notifications":true,"not_types":["com.reddit.review_open","com.reddit.review_close"],"lazy_load_members":true},"state":{"lazy_load_members":true}}}"#
             };
@@ -1056,7 +1058,10 @@ impl RedditClient {
                     ("dir", "b".to_owned()),
                     ("from", from.to_owned()),
                     ("limit", limit.clamp(1, 100).to_string()),
-                    ("filter", r#"{"types":["m.room.message"]}"#.to_owned()),
+                    (
+                        "filter",
+                        r#"{"types":["m.room.message","m.room.redaction"]}"#.to_owned(),
+                    ),
                 ])
                 .send()
                 .await

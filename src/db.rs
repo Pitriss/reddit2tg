@@ -37,6 +37,21 @@ struct MessageMapInsert<'a> {
     part_index: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct TelegramDelivery {
+    pub message_id: i64,
+    pub direction: String,
+    pub message_kind: String,
+    pub part_index: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct MessageSnapshot {
+    pub rendered_text: Option<String>,
+    pub media_file_id: Option<String>,
+    pub media_type: Option<String>,
+}
+
 impl Db {
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
@@ -117,6 +132,34 @@ impl Db {
               intro_text TEXT NOT NULL,
               updated_at INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS room_settings (
+              matrix_room_id TEXT PRIMARY KEY,
+              allow_delete INTEGER NOT NULL DEFAULT 1,
+              updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS message_snapshots (
+              matrix_event_id TEXT NOT NULL,
+              telegram_thread_id INTEGER NOT NULL,
+              telegram_message_id INTEGER NOT NULL,
+              rendered_text TEXT,
+              media_file_id TEXT,
+              media_type TEXT,
+              created_at INTEGER NOT NULL,
+              PRIMARY KEY(matrix_event_id, telegram_thread_id, telegram_message_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS matrix_reply_edges (
+              matrix_room_id TEXT NOT NULL,
+              child_event_id TEXT NOT NULL,
+              parent_event_id TEXT NOT NULL,
+              created_at INTEGER NOT NULL,
+              PRIMARY KEY(matrix_room_id, child_event_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_matrix_reply_edges_parent
+              ON matrix_reply_edges(matrix_room_id, parent_event_id);
 
             CREATE TABLE IF NOT EXISTS message_map (
               matrix_event_id TEXT NOT NULL,
@@ -341,6 +384,136 @@ impl Db {
         Ok(())
     }
 
+    pub fn allow_delete(&self, room_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let value: Option<i64> = conn
+            .query_row(
+                "SELECT allow_delete FROM room_settings WHERE matrix_room_id = ?1",
+                [room_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value.unwrap_or(1) != 0)
+    }
+
+    pub fn set_allow_delete(&self, room_id: &str, allow_delete: bool) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            r#"INSERT INTO room_settings(matrix_room_id, allow_delete, updated_at)
+               VALUES(?1, ?2, ?3)
+               ON CONFLICT(matrix_room_id) DO UPDATE SET
+                 allow_delete = excluded.allow_delete,
+                 updated_at = excluded.updated_at"#,
+            params![room_id, i64::from(allow_delete), now_unix()],
+        )?;
+        Ok(())
+    }
+
+    pub fn save_message_snapshot(
+        &self,
+        event_id: &str,
+        thread_id: i64,
+        message_id: i64,
+        rendered_text: Option<&str>,
+        media_file_id: Option<&str>,
+        media_type: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            r#"INSERT INTO message_snapshots(
+                 matrix_event_id, telegram_thread_id, telegram_message_id,
+                 rendered_text, media_file_id, media_type, created_at
+               )
+               VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+               ON CONFLICT(matrix_event_id, telegram_thread_id, telegram_message_id) DO UPDATE SET
+                 rendered_text = excluded.rendered_text,
+                 media_file_id = excluded.media_file_id,
+                 media_type = excluded.media_type,
+                 created_at = excluded.created_at"#,
+            params![
+                event_id,
+                thread_id,
+                message_id,
+                rendered_text,
+                media_file_id,
+                media_type,
+                now_unix()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn message_snapshot(
+        &self,
+        event_id: &str,
+        thread_id: i64,
+        message_id: i64,
+    ) -> Result<Option<MessageSnapshot>> {
+        let conn = self.connect()?;
+        Ok(conn
+            .query_row(
+                r#"SELECT rendered_text, media_file_id, media_type
+                   FROM message_snapshots
+                   WHERE matrix_event_id = ?1
+                     AND telegram_thread_id = ?2
+                     AND telegram_message_id = ?3"#,
+                params![event_id, thread_id, message_id],
+                |row| {
+                    Ok(MessageSnapshot {
+                        rendered_text: row.get(0)?,
+                        media_file_id: row.get(1)?,
+                        media_type: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn record_matrix_reply(
+        &self,
+        room_id: &str,
+        child_event_id: &str,
+        parent_event_id: &str,
+    ) -> Result<()> {
+        if child_event_id.is_empty()
+            || parent_event_id.is_empty()
+            || child_event_id == parent_event_id
+        {
+            return Ok(());
+        }
+        let conn = self.connect()?;
+        conn.execute(
+            r#"INSERT INTO matrix_reply_edges(
+                 matrix_room_id, child_event_id, parent_event_id, created_at
+               )
+               VALUES(?1, ?2, ?3, ?4)
+               ON CONFLICT(matrix_room_id, child_event_id) DO UPDATE SET
+                 parent_event_id = excluded.parent_event_id,
+                 created_at = excluded.created_at"#,
+            params![room_id, child_event_id, parent_event_id, now_unix()],
+        )?;
+        Ok(())
+    }
+
+    pub fn matrix_reply_subtree(&self, room_id: &str, root_event_id: &str) -> Result<Vec<String>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"WITH RECURSIVE subtree(event_id) AS (
+                 SELECT ?2
+                 UNION
+                 SELECT e.child_event_id
+                 FROM matrix_reply_edges e
+                 JOIN subtree s ON e.parent_event_id = s.event_id
+                 WHERE e.matrix_room_id = ?1
+               )
+               SELECT event_id
+               FROM subtree
+               ORDER BY CASE WHEN event_id = ?2 THEN 0 ELSE 1 END, event_id"#,
+        )?;
+        let rows = stmt.query_map(params![room_id, root_event_id], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<String>>>()?)
+    }
+
     pub fn matrix_event_seen(&self, event_id: &str) -> Result<bool> {
         let conn = self.connect()?;
         let found: Option<i64> = conn
@@ -457,6 +630,29 @@ impl Db {
                 |row| row.get(0),
             )
             .optional()?)
+    }
+
+    pub fn telegram_deliveries_for_matrix(
+        &self,
+        matrix_event_id: &str,
+        thread_id: i64,
+    ) -> Result<Vec<TelegramDelivery>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"SELECT telegram_message_id, direction, message_kind, part_index
+               FROM message_map
+               WHERE matrix_event_id = ?1 AND telegram_thread_id = ?2
+               ORDER BY part_index, telegram_message_id"#,
+        )?;
+        let rows = stmt.query_map(params![matrix_event_id, thread_id], |row| {
+            Ok(TelegramDelivery {
+                message_id: row.get(0)?,
+                direction: row.get(1)?,
+                message_kind: row.get(2)?,
+                part_index: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn matrix_event_for_telegram(
