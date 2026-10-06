@@ -101,6 +101,8 @@ impl Bridge {
         let rooms = self.db.rooms()?;
         let mut checked = 0usize;
         let mut renamed = 0usize;
+        let mut profile_updated = 0usize;
+        let mut profile_created = 0usize;
         let mut unchanged = 0usize;
         let mut unresolved = 0usize;
         let mut errors = 0usize;
@@ -133,54 +135,150 @@ impl Bridge {
                 }
             }
 
-            let expected = reconciled_title(&room.status, &name);
-            if expected == room.title {
+            let expected_title = reconciled_title(&room.status, &name);
+            let expected_intro = profile_intro_text(&name);
+            let title_changed = expected_title != room.title;
+            let stored_intro = self.db.profile_intro_message(room.telegram_thread_id)?;
+            let intro_changed = stored_intro
+                .as_ref()
+                .is_none_or(|(_, _, intro_text)| intro_text != &expected_intro);
+
+            if !title_changed && !intro_changed {
                 unchanged += 1;
                 continue;
             }
 
             if dry_run {
-                renamed += 1;
-                details.push(format!(
-                    "~ topic {}: {} -> {}",
-                    room.telegram_thread_id, room.title, expected
-                ));
+                if title_changed {
+                    renamed += 1;
+                    details.push(format!(
+                        "~ topic {}: {} -> {}",
+                        room.telegram_thread_id, room.title, expected_title
+                    ));
+                }
+                match stored_intro.as_ref() {
+                    Some((message_id, _, _)) if intro_changed => {
+                        profile_updated += 1;
+                        details.push(format!(
+                            "~ profil {} / message {}: {}",
+                            room.telegram_thread_id, message_id, expected_intro
+                        ));
+                    }
+                    None => {
+                        profile_created += 1;
+                        details.push(format!(
+                            "+ profil {}: {} (starý profile message_id není v DB; vytvoří se nový sledovaný post)",
+                            room.telegram_thread_id, expected_intro
+                        ));
+                    }
+                    _ => {}
+                }
                 continue;
             }
 
-            match self
-                .telegram
-                .rename_topic(room.telegram_thread_id, &expected)
-                .await
-            {
-                Ok(()) => {
-                    self.db.set_room_title(&room.matrix_room_id, &expected)?;
-                    renamed += 1;
-                    details.push(format!(
-                        "✓ topic {}: {} -> {}",
-                        room.telegram_thread_id, room.title, expected
-                    ));
-                    info!(
-                        matrix_room_id = %room.matrix_room_id,
-                        telegram_thread_id = room.telegram_thread_id,
-                        old_title = %room.title,
-                        new_title = %expected,
-                        "Telegram topic renamed by reconcile-names"
-                    );
+            if title_changed {
+                match self
+                    .telegram
+                    .rename_topic(room.telegram_thread_id, &expected_title)
+                    .await
+                {
+                    Ok(()) => {
+                        self.db
+                            .set_room_title(&room.matrix_room_id, &expected_title)?;
+                        renamed += 1;
+                        details.push(format!(
+                            "✓ topic {}: {} -> {}",
+                            room.telegram_thread_id, room.title, expected_title
+                        ));
+                        info!(
+                            matrix_room_id = %room.matrix_room_id,
+                            telegram_thread_id = room.telegram_thread_id,
+                            old_title = %room.title,
+                            new_title = %expected_title,
+                            "Telegram topic renamed by reconcile-names"
+                        );
+                    }
+                    Err(error) => {
+                        errors += 1;
+                        details.push(format!(
+                            "! topic {}: přejmenování {} -> {} selhalo: {}",
+                            room.telegram_thread_id, room.title, expected_title, error
+                        ));
+                    }
                 }
-                Err(error) => {
-                    errors += 1;
-                    details.push(format!(
-                        "! topic {}: přejmenování {} -> {} selhalo: {}",
-                        room.telegram_thread_id, room.title, expected, error
-                    ));
+            }
+
+            if intro_changed {
+                match stored_intro {
+                    Some((message_id, message_kind, _)) => {
+                        let edit_result = match message_kind.as_str() {
+                            "caption" => {
+                                self.telegram
+                                    .edit_message_caption(message_id, &expected_intro)
+                                    .await
+                            }
+                            "text" => {
+                                self.telegram
+                                    .edit_message_text(message_id, &expected_intro)
+                                    .await
+                            }
+                            other => Err(anyhow::anyhow!(
+                                "unknown profile intro message kind {other}"
+                            )),
+                        };
+                        match edit_result {
+                            Ok(()) => {
+                                self.db.set_profile_intro_message(
+                                    room.telegram_thread_id,
+                                    message_id,
+                                    &message_kind,
+                                    &expected_intro,
+                                )?;
+                                profile_updated += 1;
+                                details.push(format!(
+                                    "✓ profil {} / message {}: {}",
+                                    room.telegram_thread_id, message_id, expected_intro
+                                ));
+                            }
+                            Err(error) => {
+                                errors += 1;
+                                details.push(format!(
+                                    "! profil {} / message {}: aktualizace selhala: {}",
+                                    room.telegram_thread_id, message_id, error
+                                ));
+                            }
+                        }
+                    }
+                    None => {
+                        let visual = self.load_profile_visual(Some(&name)).await;
+                        if self
+                            .send_profile_intro(
+                                room.telegram_thread_id,
+                                Some(&name),
+                                visual.as_ref(),
+                            )
+                            .await
+                        {
+                            profile_created += 1;
+                            details.push(format!(
+                                "+ profil {}: {}",
+                                room.telegram_thread_id, expected_intro
+                            ));
+                        } else {
+                            errors += 1;
+                            details.push(format!(
+                                "! profil {}: vytvoření sledovaného profilového postu selhalo",
+                                room.telegram_thread_id
+                            ));
+                        }
+                    }
                 }
             }
         }
 
         let mode = if dry_run { "dry-run" } else { "apply" };
         let mut report = format!(
-            "reddit2tg reconcile-names ({mode})\nchecked: {checked}\nrenamed: {renamed}\nunchanged: {unchanged}\nunresolved: {unresolved}\nerrors: {errors}"
+            "reddit2tg reconcile-names ({mode})\nchecked: {checked}\nrenamed: {renamed}\nprofile-updated: {profile_updated}\nprofile-created: {profile_created}\nunchanged: {unchanged}\nunresolved: {unresolved}\nerrors: {errors}"
         );
         if !details.is_empty() {
             report.push_str("\n\n");
@@ -335,21 +433,17 @@ impl Bridge {
         thread_id: i64,
         profile_name: Option<&str>,
         visual: Option<&ProfileVisual>,
-    ) {
+    ) -> bool {
         let Some(profile_name) = profile_name
             .map(str::trim)
             .filter(|value| !value.is_empty())
         else {
-            return;
+            return false;
         };
-        let username = normalize_reddit_username(profile_name);
-        let intro = username
-            .as_deref()
-            .map(|username| format!("Reddit · u/{username}"))
-            .unwrap_or_else(|| format!("Reddit · {profile_name}"));
+        let intro = profile_intro_text(profile_name);
 
-        if let Some(visual) = visual {
-            if let Err(error) = self
+        let sent = if let Some(visual) = visual {
+            match self
                 .telegram
                 .send_media_with_reply(
                     thread_id,
@@ -361,26 +455,66 @@ impl Bridge {
                 )
                 .await
             {
-                warn!(
-                    error = %error,
-                    telegram_thread_id = thread_id,
-                    "Reddit profile avatar could not be sent; falling back to text intro"
-                );
-                if let Err(fallback_error) = self.telegram.send_text(thread_id, &intro).await {
+                Ok(message_id) => Some((message_id, "caption")),
+                Err(error) => {
                     warn!(
-                        error = %fallback_error,
+                        error = %error,
+                        telegram_thread_id = thread_id,
+                        "Reddit profile avatar could not be sent; falling back to text intro"
+                    );
+                    match self
+                        .telegram
+                        .send_text_with_reply(thread_id, &intro, None)
+                        .await
+                    {
+                        Ok(message_ids) => message_ids.first().copied().map(|id| (id, "text")),
+                        Err(fallback_error) => {
+                            warn!(
+                                error = %fallback_error,
+                                telegram_thread_id = thread_id,
+                                "Reddit text profile intro could not be sent"
+                            );
+                            None
+                        }
+                    }
+                }
+            }
+        } else {
+            match self
+                .telegram
+                .send_text_with_reply(thread_id, &intro, None)
+                .await
+            {
+                Ok(message_ids) => message_ids.first().copied().map(|id| (id, "text")),
+                Err(error) => {
+                    warn!(
+                        error = %error,
                         telegram_thread_id = thread_id,
                         "Reddit text profile intro could not be sent"
                     );
+                    None
                 }
             }
-        } else if let Err(error) = self.telegram.send_text(thread_id, &intro).await {
+        };
+
+        let Some((message_id, message_kind)) = sent else {
+            return false;
+        };
+
+        if let Err(error) =
+            self.db
+                .set_profile_intro_message(thread_id, message_id, message_kind, &intro)
+        {
             warn!(
                 error = %error,
                 telegram_thread_id = thread_id,
-                "Reddit text profile intro could not be sent"
+                telegram_message_id = message_id,
+                "Reddit profile intro mapping could not be persisted"
             );
+            return false;
         }
+
+        true
     }
 
     async fn create_profile_topic(&self, title: &str, profile_name: Option<&str>) -> Result<i64> {
@@ -1975,6 +2109,12 @@ fn parse_history_command(input: &str) -> Option<std::result::Result<HistoryComma
     }))
 }
 
+fn profile_intro_text(profile_name: &str) -> String {
+    normalize_reddit_username(profile_name)
+        .map(|username| format!("Reddit · u/{username}"))
+        .unwrap_or_else(|| format!("Reddit · {}", profile_name.trim()))
+}
+
 fn normalize_reddit_username(value: &str) -> Option<String> {
     let value = value.trim().strip_prefix("u/").unwrap_or(value.trim());
     if value.is_empty()
@@ -2162,8 +2302,8 @@ mod tests {
     use super::{
         fallback_topic_color, general_help_text, history_timestamp, matrix_reply_target,
         parse_help_command, parse_history_command, parse_reconcile_names_command,
-        startup_event_should_forward, topic_color_from_avatar, topic_help_text, HistoryCommand,
-        HistoryCommandKind, DEFAULT_HISTORY_LIMIT,
+        profile_intro_text, startup_event_should_forward, topic_color_from_avatar, topic_help_text,
+        HistoryCommand, HistoryCommandKind, DEFAULT_HISTORY_LIMIT,
     };
     use crate::telegram::TELEGRAM_TOPIC_COLORS;
     use image::{Rgba, RgbaImage};
@@ -2246,6 +2386,12 @@ mod tests {
 
         let white = RgbaImage::from_pixel(8, 8, Rgba([255, 255, 255, 255]));
         assert_eq!(topic_color_from_avatar(&white), TELEGRAM_TOPIC_COLORS[0]);
+    }
+
+    #[test]
+    fn profile_intro_uses_normalized_reddit_username() {
+        assert_eq!(profile_intro_text("u/example"), "Reddit · u/example");
+        assert_eq!(profile_intro_text("example"), "Reddit · u/example");
     }
 
     #[test]

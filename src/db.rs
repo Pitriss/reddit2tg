@@ -110,6 +110,14 @@ impl Db {
               archived_at INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS profile_intro_messages (
+              telegram_thread_id INTEGER PRIMARY KEY,
+              telegram_message_id INTEGER NOT NULL,
+              message_kind TEXT NOT NULL,
+              intro_text TEXT NOT NULL,
+              updated_at INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS message_map (
               matrix_event_id TEXT NOT NULL,
               matrix_room_id TEXT NOT NULL,
@@ -295,6 +303,40 @@ impl Db {
         conn.execute(
             "UPDATE rooms SET title = ?2, updated_at = ?3 WHERE matrix_room_id = ?1",
             params![room_id, title, now_unix()],
+        )?;
+        Ok(())
+    }
+
+    pub fn profile_intro_message(&self, thread_id: i64) -> Result<Option<(i64, String, String)>> {
+        let conn = self.connect()?;
+        Ok(conn
+            .query_row(
+                "SELECT telegram_message_id, message_kind, intro_text FROM profile_intro_messages WHERE telegram_thread_id = ?1",
+                [thread_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?)
+    }
+
+    pub fn set_profile_intro_message(
+        &self,
+        thread_id: i64,
+        message_id: i64,
+        message_kind: &str,
+        intro_text: &str,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            r#"INSERT INTO profile_intro_messages(
+                 telegram_thread_id, telegram_message_id, message_kind, intro_text, updated_at
+               )
+               VALUES(?1, ?2, ?3, ?4, ?5)
+               ON CONFLICT(telegram_thread_id) DO UPDATE SET
+                 telegram_message_id = excluded.telegram_message_id,
+                 message_kind = excluded.message_kind,
+                 intro_text = excluded.intro_text,
+                 updated_at = excluded.updated_at"#,
+            params![thread_id, message_id, message_kind, intro_text, now_unix()],
         )?;
         Ok(())
     }

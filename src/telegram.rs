@@ -295,6 +295,34 @@ impl TelegramClient {
         Ok(())
     }
 
+    pub async fn edit_message_text(&self, message_id: i64, text: &str) -> Result<()> {
+        let _: Message = self
+            .call(
+                "editMessageText",
+                &serde_json::json!({
+                    "chat_id": self.chat_id,
+                    "message_id": message_id,
+                    "text": text,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn edit_message_caption(&self, message_id: i64, caption: &str) -> Result<()> {
+        let _: Message = self
+            .call(
+                "editMessageCaption",
+                &serde_json::json!({
+                    "chat_id": self.chat_id,
+                    "message_id": message_id,
+                    "caption": caption,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn close_topic(&self, thread_id: i64) -> Result<()> {
         let _: bool = self
             .call(
