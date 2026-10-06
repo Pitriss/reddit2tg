@@ -2,8 +2,10 @@
 set -eu
 BIN=${1:-./reddit2tg}
 [ -f "$BIN" ] || { echo "binary not found: $BIN" >&2; exit 1; }
+install -d -m 0750 /var/lib/reddit2tg
 getent passwd reddit2tg >/dev/null 2>&1 || adduser --system --group --home /var/lib/reddit2tg --no-create-home reddit2tg
-install -d -o reddit2tg -g reddit2tg -m 0750 /var/lib/reddit2tg
+chown reddit2tg:reddit2tg /var/lib/reddit2tg
+chmod 0750 /var/lib/reddit2tg
 install -d -o root -g reddit2tg -m 0750 /etc/reddit2tg
 if [ ! -e /var/log/reddit2tg.log ]; then
   install -o reddit2tg -g reddit2tg -m 0640 /dev/null /var/log/reddit2tg.log

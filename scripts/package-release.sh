@@ -58,6 +58,8 @@ cat > "$DEB_ROOT/DEBIAN/postinst" <<'EOF_POSTINST'
 #!/bin/sh
 set -e
 
+install -d -m 0750 /var/lib/reddit2tg
+
 if ! getent group reddit2tg >/dev/null 2>&1; then
   addgroup --system reddit2tg >/dev/null
 fi
@@ -65,7 +67,8 @@ if ! getent passwd reddit2tg >/dev/null 2>&1; then
   adduser --system --ingroup reddit2tg --home /var/lib/reddit2tg --no-create-home --shell /usr/sbin/nologin reddit2tg >/dev/null
 fi
 
-install -d -o reddit2tg -g reddit2tg -m 0750 /var/lib/reddit2tg
+chown reddit2tg:reddit2tg /var/lib/reddit2tg
+chmod 0750 /var/lib/reddit2tg
 install -d -o root -g reddit2tg -m 0750 /etc/reddit2tg
 if [ ! -e /etc/reddit2tg/config.toml ]; then
   install -o root -g reddit2tg -m 0640 /usr/share/doc/reddit2tg/examples/config.toml /etc/reddit2tg/config.toml
