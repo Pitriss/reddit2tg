@@ -308,6 +308,19 @@ impl TelegramClient {
         Ok(())
     }
 
+    pub async fn delete_topic(&self, thread_id: i64) -> Result<()> {
+        let _: bool = self
+            .call(
+                "deleteForumTopic",
+                &serde_json::json!({
+                    "chat_id": self.chat_id,
+                    "message_thread_id": thread_id,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn send_text(&self, thread_id: i64, text: &str) -> Result<()> {
         self.send_text_with_reply(thread_id, text, None)
             .await

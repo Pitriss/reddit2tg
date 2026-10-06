@@ -104,6 +104,12 @@ impl Db {
               updated_at INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS archived_topics (
+              telegram_thread_id INTEGER PRIMARY KEY,
+              title TEXT NOT NULL,
+              archived_at INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS message_map (
               matrix_event_id TEXT NOT NULL,
               matrix_room_id TEXT NOT NULL,
@@ -151,6 +157,33 @@ impl Db {
 
     pub fn set_auth_alert_active(&self, active: bool) -> Result<()> {
         self.set_meta("auth_alert_active", if active { "1" } else { "0" })
+    }
+
+    pub fn record_archived_topic(&self, thread_id: i64, title: &str) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "INSERT INTO archived_topics(telegram_thread_id, title, archived_at) VALUES(?1, ?2, ?3) ON CONFLICT(telegram_thread_id) DO UPDATE SET title = excluded.title, archived_at = excluded.archived_at",
+            params![thread_id, title, now_unix()],
+        )?;
+        Ok(())
+    }
+
+    pub fn archived_topics(&self) -> Result<Vec<(i64, String)>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT telegram_thread_id, title FROM archived_topics ORDER BY archived_at, telegram_thread_id",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn remove_archived_topic(&self, thread_id: i64) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "DELETE FROM archived_topics WHERE telegram_thread_id = ?1",
+            [thread_id],
+        )?;
+        Ok(())
     }
 
     pub fn load_matrix_session(&self) -> Result<Option<StoredMatrixSession>> {

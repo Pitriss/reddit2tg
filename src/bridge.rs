@@ -577,6 +577,17 @@ impl Bridge {
             return Err(error).context("switch SQLite room mapping to reset Telegram topic");
         }
 
+        if let Err(error) = self
+            .db
+            .record_archived_topic(room.telegram_thread_id, &room.title)
+        {
+            warn!(
+                error = %error,
+                telegram_thread_id = room.telegram_thread_id,
+                "failed to record archived Telegram topic"
+            );
+        }
+
         let mut warnings = Vec::new();
         let archived_title = format!("ARCHIVED · {}", room.title);
         if let Err(error) = self
@@ -1443,6 +1454,99 @@ impl Bridge {
             return Ok(());
         }
 
+        if let Some(valid) = parse_delete_archived_command(text) {
+            let general =
+                message.message_thread_id.is_none() || message.message_thread_id == Some(1);
+
+            if !valid {
+                if general {
+                    self.telegram
+                        .send_general("Použití: /delete-archived")
+                        .await?;
+                } else if let Some(thread_id) = message.message_thread_id {
+                    self.telegram
+                        .send_text(thread_id, "Použití: /delete-archived")
+                        .await?;
+                }
+                return Ok(());
+            }
+
+            if !general {
+                if let Some(thread_id) = message.message_thread_id {
+                    self.telegram
+                        .send_text(thread_id, "/delete-archived lze spustit pouze v General.")
+                        .await?;
+                }
+                return Ok(());
+            }
+
+            let archived = self.db.archived_topics()?;
+            if archived.is_empty() {
+                self.telegram
+                    .send_general("Nejsou evidovány žádné archivované topicy.")
+                    .await?;
+                return Ok(());
+            }
+
+            let acknowledged_offset = update_id.saturating_add(1);
+            self.db
+                .set_meta("telegram_offset", &acknowledged_offset.to_string())?;
+            info!(
+                update_id,
+                telegram_offset = acknowledged_offset,
+                archived_topics = archived.len(),
+                "delete-archived command acknowledged before execution"
+            );
+
+            let total = archived.len();
+            let mut deleted = 0usize;
+            let mut failures = Vec::new();
+
+            for (thread_id, title) in archived {
+                match self.telegram.delete_topic(thread_id).await {
+                    Ok(()) => {
+                        if let Err(error) = self.db.remove_archived_topic(thread_id) {
+                            warn!(
+                                error = %error,
+                                telegram_thread_id = thread_id,
+                                "archived Telegram topic was deleted but SQLite cleanup failed"
+                            );
+                            failures.push(format!(
+                                "topic {thread_id} ({title}): smazán v Telegramu, ale záznam v SQLite se nepodařilo odstranit"
+                            ));
+                        } else {
+                            deleted += 1;
+                            info!(
+                                telegram_thread_id = thread_id,
+                                title = %title,
+                                "archived Telegram topic deleted"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        warn!(
+                            error = %error,
+                            telegram_thread_id = thread_id,
+                            title = %title,
+                            "failed to delete archived Telegram topic"
+                        );
+                        failures.push(format!("topic {thread_id} ({title}): {error}"));
+                    }
+                }
+            }
+
+            let mut report = format!(
+                "reddit2tg delete-archived\ncelkem: {total}\nsmazáno: {deleted}\nchyby: {}",
+                failures.len()
+            );
+            if !failures.is_empty() {
+                report.push_str("\n\n");
+                report.push_str(&failures.join("\n"));
+            }
+            self.telegram.send_general(&report).await?;
+            return Ok(());
+        }
+
         if let Some(command) = parse_reconcile_names_command(text) {
             match command {
                 Ok(dry_run) => {
@@ -1657,6 +1761,16 @@ fn reconciled_title(status: &str, name: &str) -> String {
     }
 }
 
+fn parse_delete_archived_command(input: &str) -> Option<bool> {
+    let mut parts = input.split_whitespace();
+    let first = parts.next()?;
+    let command = first.split('@').next().unwrap_or(first);
+    if command != "/delete-archived" && command != "/delete_archived" {
+        return None;
+    }
+    Some(parts.next().is_none())
+}
+
 fn parse_help_command(input: &str) -> Option<bool> {
     let mut parts = input.split_whitespace();
     let first = parts.next()?;
@@ -1671,6 +1785,7 @@ fn general_help_text() -> &'static str {
     "reddit2tg — General\n\
 /help — zobrazí tuto nápovědu\n\
 /reconcile-names [dry-run] — sjednotí názvy Telegram topiců s Reddit profily\n\
+/delete-archived — trvale smaže všechny bridge-em evidované archivované topicy\n\
 \n\
 Příkazy pro konkrétní Reddit chat jsou dostupné uvnitř jeho topicu."
 }
@@ -1960,6 +2075,23 @@ mod tests {
     use image::{Rgba, RgbaImage};
 
     #[test]
+    fn delete_archived_command_accepts_general_command_forms() {
+        assert_eq!(
+            super::parse_delete_archived_command("/delete-archived"),
+            Some(true)
+        );
+        assert_eq!(
+            super::parse_delete_archived_command("/delete_archived@reddit2tg_bot"),
+            Some(true)
+        );
+        assert_eq!(
+            super::parse_delete_archived_command("/delete-archived now"),
+            Some(false)
+        );
+        assert_eq!(super::parse_delete_archived_command("hello"), None);
+    }
+
+    #[test]
     fn help_command_accepts_plain_and_bot_suffix_forms() {
         assert_eq!(parse_help_command("/help"), Some(true));
         assert_eq!(parse_help_command("/help@reddit2tg_bot"), Some(true));
@@ -1970,6 +2102,7 @@ mod tests {
     #[test]
     fn help_text_is_context_specific_and_uses_current_history_limit() {
         assert!(general_help_text().contains("/reconcile-names"));
+        assert!(general_help_text().contains("/delete-archived"));
         assert!(!general_help_text().contains("/reset-chat"));
 
         let invite = topic_help_text(Some("invite"));
