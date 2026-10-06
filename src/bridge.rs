@@ -1,4 +1,8 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -10,7 +14,7 @@ use crate::{
     db::{Db, RoomMap},
     reddit::{
         is_auth_refresh_error, matrix_localpart, member_display_name, InvitedRoom, JoinedRoom,
-        RedditClient,
+        MatrixEvent, RedditClient,
     },
     telegram::{Message, TelegramClient},
 };
@@ -21,6 +25,7 @@ pub struct Bridge {
     db: Db,
     reddit: RedditClient,
     telegram: TelegramClient,
+    startup_ms: i64,
 }
 
 const DEFAULT_HISTORY_LIMIT: usize = 50;
@@ -60,6 +65,7 @@ impl Bridge {
             db,
             reddit,
             telegram,
+            startup_ms: unix_ms(),
         }
     }
 
@@ -508,8 +514,16 @@ impl Bridge {
                     .await
                     .with_context(|| format!("initial invite room {room_id}"))?;
             }
+            for (room_id, room) in sync.rooms.join {
+                self.process_initial_joined_room(&room_id, room)
+                    .await
+                    .with_context(|| format!("initial joined room {room_id}"))?;
+            }
             self.db.set_meta("matrix_next_batch", &sync.next_batch)?;
-            info!("initial Matrix checkpoint established; historical joined-room timeline was not forwarded");
+            info!(
+                startup_ms = self.startup_ms,
+                "initial Matrix checkpoint established; only joined-room events created after bridge startup were forwarded"
+            );
             return Ok(());
         }
 
@@ -527,6 +541,81 @@ impl Bridge {
         self.db.set_meta("matrix_next_batch", &sync.next_batch)?;
         let _ = self.db.prune_seen_events(30 * 24 * 3600);
         Ok(())
+    }
+
+    async fn process_initial_joined_room(&self, room_id: &str, mut room: JoinedRoom) -> Result<()> {
+        let cutoff_ms = self.startup_ms;
+        let mut events = std::mem::take(&mut room.timeline.events);
+        let mut from = room.timeline.prev_batch.take();
+
+        // Keep only the startup window, but if Matrix truncated the initial
+        // timeline, walk backwards until we have crossed the startup boundary.
+        if room.timeline.limited {
+            let mut visited_tokens = HashSet::new();
+            while !startup_boundary_crossed(&events, cutoff_ms) {
+                let Some(token) = from.take() else {
+                    warn!(
+                        matrix_room_id = %room_id,
+                        "initial Matrix timeline was limited but had no prev_batch; startup-window completeness cannot be guaranteed"
+                    );
+                    break;
+                };
+                if !visited_tokens.insert(token.clone()) {
+                    warn!(
+                        matrix_room_id = %room_id,
+                        "Matrix room-history pagination repeated a token during startup backfill"
+                    );
+                    break;
+                }
+
+                let (mut older, next) = self
+                    .reddit
+                    .room_messages_before(room_id, &token, 100, self.cfg.bridge.refresh_before_secs)
+                    .await?;
+                if older.is_empty() {
+                    break;
+                }
+
+                let crossed = startup_boundary_crossed(&older, cutoff_ms);
+                // /messages?dir=b returns newest -> oldest. The /sync timeline
+                // is chronological, so reverse each older page before prepend.
+                older.reverse();
+                older.extend(events);
+                events = older;
+
+                let next = next.filter(|value| !value.is_empty());
+                if crossed {
+                    break;
+                }
+                if next.as_deref() == Some(token.as_str()) {
+                    warn!(
+                        matrix_room_id = %room_id,
+                        "Matrix room-history pagination did not advance during startup backfill"
+                    );
+                    break;
+                }
+                from = next;
+            }
+        }
+
+        let returned_events = events.len();
+        events.retain(|event| startup_event_should_forward(event.origin_server_ts, cutoff_ms));
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        info!(
+            matrix_room_id = %room_id,
+            startup_ms = cutoff_ms,
+            returned_events,
+            startup_events = events.len(),
+            "forwarding Matrix events that arrived during bridge startup"
+        );
+
+        room.timeline.events = events;
+        room.timeline.limited = false;
+        room.timeline.prev_batch = None;
+        self.process_joined_room(room_id, room).await
     }
 
     async fn process_invite(&self, room_id: &str, room: InvitedRoom) -> Result<()> {
@@ -1091,12 +1180,36 @@ fn clean_name(value: &str) -> String {
     base.chars().take(110).collect()
 }
 
+fn startup_event_should_forward(origin_server_ts: i64, cutoff_ms: i64) -> bool {
+    origin_server_ts >= cutoff_ms
+}
+
+fn startup_boundary_crossed(events: &[MatrixEvent], cutoff_ms: i64) -> bool {
+    events
+        .iter()
+        .any(|event| event.origin_server_ts > 0 && event.origin_server_ts < cutoff_ms)
+}
+
+fn unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_history_command, parse_reconcile_names_command, HistoryCommand, HistoryCommandKind,
-        DEFAULT_HISTORY_LIMIT,
+        parse_history_command, parse_reconcile_names_command, startup_event_should_forward,
+        HistoryCommand, HistoryCommandKind, DEFAULT_HISTORY_LIMIT,
     };
+
+    #[test]
+    fn startup_cutoff_forwards_only_events_at_or_after_start() {
+        assert!(!startup_event_should_forward(999, 1_000));
+        assert!(startup_event_should_forward(1_000, 1_000));
+        assert!(startup_event_should_forward(1_001, 1_000));
+    }
 
     #[test]
     fn reconcile_names_command_accepts_hyphen_and_underscore_forms() {

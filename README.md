@@ -45,7 +45,8 @@ The default history limit is 50 text/notice messages and the accepted maximum is
 - pending Reddit read markers survive restart and are retried without re-sending the Telegram message
 - the SQLite database file is forced to mode `0600` on Unix
 - the bridge uses Telegram long polling and requires no public IP address, inbound TCP port, or Telegram webhook
-- first Matrix `/sync` establishes a safe checkpoint and deliberately does not replay old joined-room timelines automatically; explicit `/reload-history` or `/reset-chat` is used when history recovery is wanted
+- the first Matrix `/sync` establishes a safe checkpoint without replaying old joined-room history, while events whose `origin_server_ts` is at or after bridge startup are still forwarded; a limited initial timeline is backfilled through `prev_batch` until the startup boundary is crossed
+- explicit `/reload-history` or `/reset-chat` remains available when older history recovery is wanted
 
 ### Operations and deployment
 

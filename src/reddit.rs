@@ -120,6 +120,10 @@ pub struct InvitedRoom {
 pub struct EventBlock {
     #[serde(default)]
     pub events: Vec<MatrixEvent>,
+    #[serde(default)]
+    pub limited: bool,
+    #[serde(default)]
+    pub prev_batch: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -130,6 +134,8 @@ pub struct MatrixEvent {
     pub event_id: String,
     #[serde(default)]
     pub sender: String,
+    #[serde(default)]
+    pub origin_server_ts: i64,
     #[serde(default)]
     pub state_key: Option<String>,
     #[serde(default)]
@@ -443,7 +449,11 @@ impl RedditClient {
         for attempt in 0..2 {
             let session = self.ensure_session(refresh_before_secs).await?;
             let url = format!("{}/_matrix/client/v3/sync", self.homeserver);
-            let filter = r#"{"room":{"timeline":{"unread_thread_notifications":true,"not_types":["com.reddit.review_open","com.reddit.review_close"],"lazy_load_members":true},"state":{"lazy_load_members":true}}}"#;
+            let filter = if since.is_none() {
+                r#"{"room":{"timeline":{"limit":100,"types":["m.room.message"],"lazy_load_members":true},"state":{"lazy_load_members":true}}}"#
+            } else {
+                r#"{"room":{"timeline":{"unread_thread_notifications":true,"not_types":["com.reddit.review_open","com.reddit.review_close"],"lazy_load_members":true},"state":{"lazy_load_members":true}}}"#
+            };
             let mut req = self
                 .http
                 .get(url)
@@ -604,6 +614,58 @@ impl RedditClient {
                 .error_for_status()
                 .context("Matrix read_markers failed")?;
             return Ok(());
+        }
+        unreachable!()
+    }
+
+    pub async fn room_messages_before(
+        &self,
+        room_id: &str,
+        from: &str,
+        limit: usize,
+        refresh_before_secs: u64,
+    ) -> Result<(Vec<MatrixEvent>, Option<String>)> {
+        let room = urlencoding::encode(room_id);
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{room}/messages",
+            self.homeserver
+        );
+
+        for attempt in 0..2 {
+            let session = self.ensure_session(refresh_before_secs).await?;
+            let response = self
+                .http
+                .get(&url)
+                .bearer_auth(&session.access_token)
+                .query(&[
+                    ("dir", "b".to_owned()),
+                    ("from", from.to_owned()),
+                    ("limit", limit.clamp(1, 100).to_string()),
+                    ("filter", r#"{"types":["m.room.message"]}"#.to_owned()),
+                ])
+                .send()
+                .await
+                .context("Matrix startup history request failed")?;
+
+            if response.status() == StatusCode::UNAUTHORIZED {
+                if attempt == 0 {
+                    self.refresh_after_unauthorized("startup room history")
+                        .await?;
+                    continue;
+                }
+                self.invalidate_session().await?;
+                return Err(auth_error(
+                    "Matrix startup room history rejected the refreshed access token",
+                ));
+            }
+
+            let page: MessagesResponse = response
+                .error_for_status()
+                .context("Matrix startup room history failed")?
+                .json()
+                .await
+                .context("invalid Matrix startup room history JSON")?;
+            return Ok((page.chunk, page.end));
         }
         unreachable!()
     }
