@@ -1,7 +1,10 @@
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use reqwest::Client;
+use reqwest::{
+    multipart::{Form, Part},
+    Client,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -9,6 +12,7 @@ use serde_json::Value;
 pub struct TelegramClient {
     http: Client,
     base: String,
+    file_base: String,
     chat_id: i64,
     operator_user_id: i64,
 }
@@ -40,8 +44,16 @@ pub struct Message {
     pub chat: Chat,
     pub from: Option<User>,
     pub text: Option<String>,
+    pub caption: Option<String>,
     pub entities: Option<Vec<Value>>,
     pub reply_to_message: Option<Box<Message>>,
+    pub photo: Option<Vec<PhotoSize>>,
+    pub document: Option<Document>,
+    pub animation: Option<Animation>,
+    pub video: Option<Value>,
+    pub audio: Option<Value>,
+    pub voice: Option<Value>,
+    pub sticker: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,6 +69,48 @@ pub struct User {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct PhotoSize {
+    pub file_id: String,
+    pub file_size: Option<u64>,
+    pub width: i64,
+    pub height: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Document {
+    pub file_id: String,
+    pub file_name: Option<String>,
+    pub mime_type: Option<String>,
+    pub file_size: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Animation {
+    pub file_id: String,
+    pub file_name: Option<String>,
+    pub mime_type: Option<String>,
+    pub file_size: Option<u64>,
+    pub width: i64,
+    pub height: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TelegramImageAttachment {
+    pub file_id: String,
+    pub file_name: String,
+    pub file_size: Option<u64>,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    pub caption: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramFile {
+    file_path: Option<String>,
+    file_size: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ForumTopic {
     message_thread_id: i64,
 }
@@ -68,12 +122,92 @@ struct GetUpdatesBody {
     allowed_updates: [&'static str; 1],
 }
 
+pub const TELEGRAM_DOWNLOAD_LIMIT: u64 = 20 << 20;
+pub const TELEGRAM_PHOTO_UPLOAD_LIMIT: usize = 10 << 20;
+pub const TELEGRAM_FILE_UPLOAD_LIMIT: usize = 50 << 20;
+
+impl Message {
+    pub fn image_attachment(&self) -> Option<TelegramImageAttachment> {
+        if let Some(photo) = self.photo.as_ref().and_then(|sizes| {
+            sizes
+                .iter()
+                .max_by_key(|item| item.width.saturating_mul(item.height))
+        }) {
+            return Some(TelegramImageAttachment {
+                file_id: photo.file_id.clone(),
+                file_name: "telegram-photo.jpg".to_owned(),
+                file_size: photo.file_size,
+                width: Some(photo.width),
+                height: Some(photo.height),
+                caption: self.caption.clone(),
+            });
+        }
+
+        if let Some(animation) = self.animation.as_ref() {
+            if animation
+                .mime_type
+                .as_deref()
+                .is_some_and(|mime| mime.starts_with("image/"))
+            {
+                return Some(TelegramImageAttachment {
+                    file_id: animation.file_id.clone(),
+                    file_name: animation
+                        .file_name
+                        .clone()
+                        .unwrap_or_else(|| "telegram-animation.gif".to_owned()),
+                    file_size: animation.file_size,
+                    width: Some(animation.width),
+                    height: Some(animation.height),
+                    caption: self.caption.clone(),
+                });
+            }
+        }
+
+        if let Some(document) = self.document.as_ref() {
+            let image_mime = document
+                .mime_type
+                .as_deref()
+                .is_some_and(|mime| mime.starts_with("image/"));
+            let image_name = document
+                .file_name
+                .as_deref()
+                .is_some_and(looks_like_image_name);
+            if image_mime || image_name {
+                return Some(TelegramImageAttachment {
+                    file_id: document.file_id.clone(),
+                    file_name: document
+                        .file_name
+                        .clone()
+                        .unwrap_or_else(|| "telegram-image".to_owned()),
+                    file_size: document.file_size,
+                    width: None,
+                    height: None,
+                    caption: self.caption.clone(),
+                });
+            }
+        }
+
+        None
+    }
+
+    pub fn has_attachment(&self) -> bool {
+        self.photo.is_some()
+            || self.document.is_some()
+            || self.animation.is_some()
+            || self.video.is_some()
+            || self.audio.is_some()
+            || self.voice.is_some()
+            || self.sticker.is_some()
+    }
+}
+
 impl TelegramClient {
     pub fn new(bot_token: &str, chat_id: i64, operator_user_id: i64) -> Result<Self> {
         let http = Client::builder().timeout(Duration::from_secs(60)).build()?;
         Ok(Self {
             http,
             base: format!("https://api.telegram.org/bot{}", bot_token.trim()),
+            file_base: format!("https://api.telegram.org/file/bot{}", bot_token.trim()),
             chat_id,
             operator_user_id,
         })
@@ -292,6 +426,146 @@ impl TelegramClient {
         Ok(())
     }
 
+    pub async fn download_file(&self, file_id: &str) -> Result<Vec<u8>> {
+        let file: TelegramFile = self
+            .call("getFile", &serde_json::json!({"file_id": file_id}))
+            .await?;
+        if file
+            .file_size
+            .is_some_and(|size| size > TELEGRAM_DOWNLOAD_LIMIT)
+        {
+            bail!(
+                "Telegram file exceeds the Bot API download limit of {} bytes",
+                TELEGRAM_DOWNLOAD_LIMIT
+            );
+        }
+        let file_path = file
+            .file_path
+            .ok_or_else(|| anyhow::anyhow!("Telegram getFile returned no file_path"))?;
+        let url = format!("{}/{}", self.file_base, file_path.trim_start_matches('/'));
+        let response = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .context("Telegram file download request failed")?
+            .error_for_status()
+            .context("Telegram file download failed")?;
+        let data = response
+            .bytes()
+            .await
+            .context("Telegram file download body failed")?;
+        if data.len() as u64 > TELEGRAM_DOWNLOAD_LIMIT {
+            bail!(
+                "Telegram file exceeds the Bot API download limit of {} bytes",
+                TELEGRAM_DOWNLOAD_LIMIT
+            );
+        }
+        Ok(data.to_vec())
+    }
+
+    pub async fn send_media_with_reply(
+        &self,
+        thread_id: i64,
+        data: &[u8],
+        file_name: &str,
+        mime_type: &str,
+        caption: Option<&str>,
+        reply_to_message_id: Option<i64>,
+    ) -> Result<i64> {
+        if data.len() > TELEGRAM_FILE_UPLOAD_LIMIT {
+            bail!(
+                "media exceeds Telegram Bot API upload limit of {} bytes",
+                TELEGRAM_FILE_UPLOAD_LIMIT
+            );
+        }
+
+        let (method, field_name) = if mime_type == "image/gif" {
+            ("sendAnimation", "animation")
+        } else if matches!(mime_type, "image/jpeg" | "image/png")
+            && data.len() <= TELEGRAM_PHOTO_UPLOAD_LIMIT
+        {
+            ("sendPhoto", "photo")
+        } else {
+            ("sendDocument", "document")
+        };
+
+        let url = format!("{}/{}", self.base, method);
+        const MAX_RATE_LIMIT_RETRIES: usize = 5;
+        for retry in 0..=MAX_RATE_LIMIT_RETRIES {
+            let part = Part::bytes(data.to_vec())
+                .file_name(file_name.to_owned())
+                .mime_str(mime_type)
+                .with_context(|| format!("invalid media MIME type {mime_type}"))?;
+            let mut form = Form::new()
+                .text("chat_id", self.chat_id.to_string())
+                .text("message_thread_id", thread_id.to_string())
+                .part(field_name.to_owned(), part);
+            if let Some(caption) = caption
+                .map(str::trim)
+                .filter(|caption| !caption.is_empty() && *caption != "Image")
+            {
+                form = form.text("caption", caption.chars().take(1000).collect::<String>());
+            }
+            if let Some(reply_to_message_id) = reply_to_message_id {
+                form = form.text(
+                    "reply_parameters",
+                    serde_json::json!({
+                        "message_id": reply_to_message_id,
+                        "allow_sending_without_reply": true,
+                    })
+                    .to_string(),
+                );
+            }
+
+            let response = self
+                .http
+                .post(&url)
+                .multipart(form)
+                .send()
+                .await
+                .with_context(|| format!("Telegram {method} request failed"))?;
+            let status = response.status();
+            let parsed: ApiResponse<Message> = response.json().await.with_context(|| {
+                format!("Telegram {method} returned invalid JSON (HTTP {status})")
+            })?;
+            if parsed.ok {
+                let message = parsed.result.ok_or_else(|| {
+                    anyhow::anyhow!("Telegram {method} returned ok without result")
+                })?;
+                return Ok(message.message_id);
+            }
+
+            if let Some(retry_after) = parsed
+                .parameters
+                .as_ref()
+                .and_then(|parameters| parameters.retry_after)
+            {
+                if retry < MAX_RATE_LIMIT_RETRIES {
+                    let wait_secs = retry_after.saturating_add(1);
+                    tracing::warn!(
+                        method,
+                        retry_after_secs = retry_after,
+                        wait_secs,
+                        retry = retry + 1,
+                        "Telegram flood control during media upload; waiting before retry"
+                    );
+                    tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+                    continue;
+                }
+            }
+
+            bail!(
+                "Telegram {method} failed (HTTP {status}): {}",
+                parsed
+                    .description
+                    .unwrap_or_else(|| "unknown error".to_owned())
+            );
+        }
+
+        unreachable!()
+    }
+
     pub async fn get_updates(&self, offset: i64, timeout: u64) -> Result<Vec<Update>> {
         self.call(
             "getUpdates",
@@ -370,6 +644,13 @@ impl TelegramClient {
 
         unreachable!()
     }
+}
+
+fn looks_like_image_name(file_name: &str) -> bool {
+    let lower = file_name.to_ascii_lowercase();
+    [".jpg", ".jpeg", ".png", ".gif", ".webp"]
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
 }
 
 fn sanitize_topic_title(input: &str) -> String {

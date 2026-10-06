@@ -278,12 +278,32 @@ impl Db {
         Ok(found.is_some())
     }
 
+    pub fn mark_matrix_event_seen(&self, event_id: &str, room_id: &str) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "INSERT OR IGNORE INTO seen_matrix_events(event_id, matrix_room_id, created_at) VALUES(?1, ?2, ?3)",
+            params![event_id, room_id, now_unix()],
+        )?;
+        Ok(())
+    }
+
     pub fn record_matrix_delivery(
         &self,
         room_id: &str,
         event_id: &str,
         thread_id: i64,
         telegram_message_ids: &[i64],
+    ) -> Result<()> {
+        self.record_matrix_delivery_kind(room_id, event_id, thread_id, telegram_message_ids, "text")
+    }
+
+    pub fn record_matrix_delivery_kind(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        thread_id: i64,
+        telegram_message_ids: &[i64],
+        message_kind: &str,
     ) -> Result<()> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
@@ -300,7 +320,7 @@ impl Db {
                     thread_id,
                     message_id: *message_id,
                     direction: "matrix_to_telegram",
-                    message_kind: "text",
+                    message_kind,
                     part_index: part_index as i64,
                 },
             )?;
@@ -316,6 +336,23 @@ impl Db {
         thread_id: i64,
         telegram_message_id: i64,
     ) -> Result<()> {
+        self.record_telegram_delivery_kind(
+            room_id,
+            event_id,
+            thread_id,
+            telegram_message_id,
+            "text",
+        )
+    }
+
+    pub fn record_telegram_delivery_kind(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        thread_id: i64,
+        telegram_message_id: i64,
+        message_kind: &str,
+    ) -> Result<()> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         tx.execute(
@@ -330,7 +367,7 @@ impl Db {
                 thread_id,
                 message_id: telegram_message_id,
                 direction: "telegram_to_matrix",
-                message_kind: "text",
+                message_kind,
                 part_index: 0,
             },
         )?;

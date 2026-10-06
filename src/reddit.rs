@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use reqwest::{Client, StatusCode};
+use reqwest::{header::CONTENT_TYPE, Client, StatusCode};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::RwLock;
@@ -153,10 +153,56 @@ struct SendResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct UploadResponse {
+    content_uri: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct MessagesResponse {
     #[serde(default)]
     chunk: Vec<MatrixEvent>,
     end: Option<String>,
+}
+
+pub const REDDIT_MAX_UPLOAD_SIZE: usize = 20 << 20;
+pub const REDDIT_MAX_GIF_UPLOAD_SIZE: usize = 100 << 20;
+const REDDIT_MAX_MEDIA_DOWNLOAD_SIZE: usize = 110 << 20;
+
+pub fn reddit_upload_limit(mime_type: &str) -> Option<usize> {
+    match mime_type {
+        "image/gif" => Some(REDDIT_MAX_GIF_UPLOAD_SIZE),
+        "image/jpeg" | "image/png" | "image/webp" => Some(REDDIT_MAX_UPLOAD_SIZE),
+        _ => None,
+    }
+}
+
+pub fn detect_supported_image_mime(data: &[u8]) -> Option<&'static str> {
+    if data.len() >= 3 && data[..3] == [0xff, 0xd8, 0xff] {
+        return Some("image/jpeg");
+    }
+    if data.len() >= 8 && data[..8] == [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a] {
+        return Some("image/png");
+    }
+    if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if data.len() >= 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    None
+}
+
+pub struct SendImageRequest<'a> {
+    pub room_id: &'a str,
+    pub data: &'a [u8],
+    pub file_name: &'a str,
+    pub mime_type: &'a str,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    pub txn_id: &'a str,
+    pub thread_root_event_id: Option<&'a str>,
+    pub reply_to_event_id: Option<&'a str>,
+    pub refresh_before_secs: u64,
 }
 
 impl RedditClient {
@@ -479,6 +525,211 @@ impl RedditClient {
             }
             let response = response.error_for_status().context("Matrix /sync failed")?;
             return Ok(response.json().await?);
+        }
+        unreachable!()
+    }
+
+    pub async fn download_media(
+        &self,
+        mxc_uri: &str,
+        refresh_before_secs: u64,
+    ) -> Result<(Vec<u8>, String)> {
+        let (server, media_id) = parse_mxc_uri(mxc_uri)
+            .ok_or_else(|| anyhow!("unsupported Reddit media URI: {}", truncate(mxc_uri, 200)))?;
+        let url = format!(
+            "{}/_matrix/media/v3/download/{}/{}",
+            self.homeserver,
+            urlencoding::encode(&server),
+            urlencoding::encode(&media_id),
+        );
+
+        for attempt in 0..2 {
+            let session = self.ensure_session(refresh_before_secs).await?;
+            let response = self
+                .http
+                .get(&url)
+                .bearer_auth(&session.access_token)
+                .send()
+                .await
+                .context("Matrix media download request failed")?;
+            if response.status() == StatusCode::UNAUTHORIZED {
+                if attempt == 0 {
+                    self.refresh_after_unauthorized("media download").await?;
+                    continue;
+                }
+                self.invalidate_session().await?;
+                return Err(auth_error(
+                    "Matrix media download rejected the refreshed access token",
+                ));
+            }
+            let response = response
+                .error_for_status()
+                .context("Matrix media download failed")?;
+            if response
+                .content_length()
+                .is_some_and(|size| size > REDDIT_MAX_MEDIA_DOWNLOAD_SIZE as u64)
+            {
+                bail!(
+                    "Reddit media exceeds download safety limit of {} bytes",
+                    REDDIT_MAX_MEDIA_DOWNLOAD_SIZE
+                );
+            }
+            let mime_type = response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("application/octet-stream")
+                .split(';')
+                .next()
+                .unwrap_or("application/octet-stream")
+                .trim()
+                .to_owned();
+            let data = response
+                .bytes()
+                .await
+                .context("Matrix media download body failed")?;
+            if data.len() > REDDIT_MAX_MEDIA_DOWNLOAD_SIZE {
+                bail!(
+                    "Reddit media exceeds download safety limit of {} bytes",
+                    REDDIT_MAX_MEDIA_DOWNLOAD_SIZE
+                );
+            }
+            return Ok((data.to_vec(), mime_type));
+        }
+        unreachable!()
+    }
+
+    pub async fn upload_media(
+        &self,
+        data: &[u8],
+        file_name: &str,
+        mime_type: &str,
+        refresh_before_secs: u64,
+    ) -> Result<String> {
+        let Some(limit) = reddit_upload_limit(mime_type) else {
+            bail!("Reddit chat does not support uploading {mime_type}");
+        };
+        if data.len() > limit {
+            bail!(
+                "Reddit chat upload is {} bytes; limit for {} is {} bytes",
+                data.len(),
+                mime_type,
+                limit
+            );
+        }
+
+        for attempt in 0..2 {
+            let session = self.ensure_session(refresh_before_secs).await?;
+            let url = format!("{}/_matrix/media/v3/upload", self.homeserver);
+            let response = self
+                .http
+                .post(url)
+                .bearer_auth(&session.access_token)
+                .query(&[("filename", file_name)])
+                .header(CONTENT_TYPE, mime_type)
+                .body(data.to_vec())
+                .send()
+                .await
+                .context("Matrix media upload request failed")?;
+            if response.status() == StatusCode::UNAUTHORIZED {
+                if attempt == 0 {
+                    self.refresh_after_unauthorized("media upload").await?;
+                    continue;
+                }
+                self.invalidate_session().await?;
+                return Err(auth_error(
+                    "Matrix media upload rejected the refreshed access token",
+                ));
+            }
+            let status = response.status();
+            if !status.is_success() {
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|error| format!("<failed to read response body: {error}>"));
+                bail!("Matrix media upload failed: HTTP {status}: {body}");
+            }
+            let response: UploadResponse = response
+                .json()
+                .await
+                .context("Matrix media upload returned invalid JSON")?;
+            return Ok(response.content_uri);
+        }
+        unreachable!()
+    }
+
+    pub async fn send_image(&self, request: SendImageRequest<'_>) -> Result<String> {
+        let content_uri = self
+            .upload_media(
+                request.data,
+                request.file_name,
+                request.mime_type,
+                request.refresh_before_secs,
+            )
+            .await?;
+
+        for attempt in 0..2 {
+            let session = self.ensure_session(request.refresh_before_secs).await?;
+            let room = urlencoding::encode(request.room_id);
+            let txn = urlencoding::encode(request.txn_id);
+            let url = format!(
+                "{}/_matrix/client/v3/rooms/{room}/send/m.room.message/{txn}",
+                self.homeserver
+            );
+            let mut info = serde_json::json!({
+                "mimetype": request.mime_type,
+                "size": request.data.len(),
+            });
+            if let Some(width) = request.width.filter(|value| *value > 0) {
+                info["w"] = serde_json::json!(width);
+            }
+            if let Some(height) = request.height.filter(|value| *value > 0) {
+                info["h"] = serde_json::json!(height);
+            }
+            let mut content = serde_json::json!({
+                "msgtype": "m.image",
+                "body": "Image",
+                "url": content_uri,
+                "info": info,
+            });
+            if let (Some(thread_root_event_id), Some(reply_to_event_id)) =
+                (request.thread_root_event_id, request.reply_to_event_id)
+            {
+                content["m.relates_to"] =
+                    reddit_reply_relation(thread_root_event_id, reply_to_event_id);
+            }
+
+            let response = self
+                .http
+                .put(url)
+                .bearer_auth(&session.access_token)
+                .json(&content)
+                .send()
+                .await
+                .context("Matrix send image request failed")?;
+            if response.status() == StatusCode::UNAUTHORIZED {
+                if attempt == 0 {
+                    self.refresh_after_unauthorized("send image").await?;
+                    continue;
+                }
+                self.invalidate_session().await?;
+                return Err(auth_error(
+                    "Matrix send image rejected the refreshed access token",
+                ));
+            }
+            let status = response.status();
+            if !status.is_success() {
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|error| format!("<failed to read response body: {error}>"));
+                bail!("Matrix send image failed: HTTP {status}: {body}");
+            }
+            let response: SendResponse = response
+                .json()
+                .await
+                .context("Matrix send image returned invalid JSON")?;
+            return Ok(response.event_id);
         }
         unreachable!()
     }
@@ -960,8 +1211,19 @@ fn reddit_reply_relation(thread_root_event_id: &str, reply_to_event_id: &str) ->
         "m.in_reply_to": {
             "event_id": reply_to_event_id,
         },
-        "is_falling_back": thread_root_event_id == reply_to_event_id,
+        // Reddit's current web client keeps this true even when replying
+        // to a child event inside an existing thread.
+        "is_falling_back": true,
     })
+}
+
+fn parse_mxc_uri(value: &str) -> Option<(String, String)> {
+    let rest = value.strip_prefix("mxc://")?;
+    let (server, media_id) = rest.split_once('/')?;
+    if server.is_empty() || media_id.is_empty() {
+        return None;
+    }
+    Some((server.to_owned(), media_id.to_owned()))
 }
 
 fn counterpart_from_joined_members(value: &Value, own_user_id: &str) -> Option<(String, String)> {
@@ -1151,10 +1413,33 @@ fn truncate(value: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        counterpart_from_members, extract_token_blob, jwt_expires_at_ms, reddit_reply_relation,
-        strip_cookie,
+        counterpart_from_members, detect_supported_image_mime, extract_token_blob,
+        jwt_expires_at_ms, parse_mxc_uri, reddit_reply_relation, strip_cookie,
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+    #[test]
+    fn parses_mxc_media_uri() {
+        assert_eq!(
+            parse_mxc_uri("mxc://reddit.com/abc123"),
+            Some(("reddit.com".to_owned(), "abc123".to_owned()))
+        );
+        assert_eq!(parse_mxc_uri("https://i.redd.it/file.jpg"), None);
+    }
+
+    #[test]
+    fn detects_supported_reddit_image_bytes() {
+        assert_eq!(
+            detect_supported_image_mime(&[0xff, 0xd8, 0xff, 0xe0]),
+            Some("image/jpeg")
+        );
+        assert_eq!(detect_supported_image_mime(b"GIF89a123"), Some("image/gif"));
+        assert_eq!(
+            detect_supported_image_mime(b"RIFF1234WEBPmore"),
+            Some("image/webp")
+        );
+        assert_eq!(detect_supported_image_mime(b"%PDF-1.7"), None);
+    }
 
     #[test]
     fn strips_only_token_v2_cookie() {
@@ -1182,7 +1467,7 @@ mod tests {
                 "rel_type": "m.thread",
                 "event_id": "$root",
                 "m.in_reply_to": {"event_id": "$child"},
-                "is_falling_back": false
+                "is_falling_back": true
             })
         );
     }

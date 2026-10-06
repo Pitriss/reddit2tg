@@ -13,10 +13,10 @@ use crate::{
     config::Config,
     db::{Db, RoomMap},
     reddit::{
-        is_auth_refresh_error, matrix_localpart, member_display_name, InvitedRoom, JoinedRoom,
-        MatrixEvent, RedditClient,
+        detect_supported_image_mime, is_auth_refresh_error, matrix_localpart, member_display_name,
+        reddit_upload_limit, InvitedRoom, JoinedRoom, MatrixEvent, RedditClient, SendImageRequest,
     },
-    telegram::{Message, TelegramClient},
+    telegram::{Message, TelegramClient, TELEGRAM_DOWNLOAD_LIMIT, TELEGRAM_FILE_UPLOAD_LIMIT},
 };
 
 #[derive(Clone)]
@@ -768,23 +768,11 @@ impl Bridge {
             if self.db.matrix_event_seen(&event.event_id)? {
                 continue;
             }
-            let Some(body) = event.content.get("body").and_then(Value::as_str) else {
-                continue;
-            };
             let msgtype = event
                 .content
                 .get("msgtype")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            if msgtype != "m.text" && msgtype != "m.notice" {
-                continue;
-            }
-            let rendered = if event.sender == own {
-                let sender_name = own_display_name.as_deref().unwrap_or("Ty (Reddit)");
-                format!("{sender_name}: {body}")
-            } else {
-                body.to_owned()
-            };
             let reply_to_message_id =
                 if let Some(reply_event_id) = matrix_reply_target(&event.content) {
                     self.db
@@ -793,15 +781,46 @@ impl Bridge {
                     None
                 };
 
-            let telegram_message_ids = self
-                .telegram
-                .send_text_with_reply(mapping.telegram_thread_id, &rendered, reply_to_message_id)
-                .await?;
-            self.db.record_matrix_delivery(
+            let (telegram_message_ids, message_kind) = match msgtype {
+                "m.text" | "m.notice" => {
+                    let Some(body) = event.content.get("body").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let rendered = if event.sender == own {
+                        let sender_name = own_display_name.as_deref().unwrap_or("Ty (Reddit)");
+                        format!("{sender_name}: {body}")
+                    } else {
+                        body.to_owned()
+                    };
+                    (
+                        self.telegram
+                            .send_text_with_reply(
+                                mapping.telegram_thread_id,
+                                &rendered,
+                                reply_to_message_id,
+                            )
+                            .await?,
+                        "text",
+                    )
+                }
+                "m.image" | "m.file" | "m.video" | "m.audio" => (
+                    self.forward_matrix_media(
+                        mapping.telegram_thread_id,
+                        &event,
+                        reply_to_message_id,
+                    )
+                    .await?,
+                    msgtype.strip_prefix("m.").unwrap_or("media"),
+                ),
+                _ => continue,
+            };
+
+            self.db.record_matrix_delivery_kind(
                 room_id,
                 &event.event_id,
                 mapping.telegram_thread_id,
                 &telegram_message_ids,
+                message_kind,
             )?;
             if event.sender != own {
                 self.db.queue_read_receipt(room_id, &event.event_id)?;
@@ -809,6 +828,112 @@ impl Bridge {
             }
         }
         Ok(())
+    }
+
+    async fn forward_matrix_media(
+        &self,
+        thread_id: i64,
+        event: &MatrixEvent,
+        reply_to_message_id: Option<i64>,
+    ) -> Result<Vec<i64>> {
+        let body = event
+            .content
+            .get("body")
+            .and_then(Value::as_str)
+            .unwrap_or("media");
+        let msgtype = event
+            .content
+            .get("msgtype")
+            .and_then(Value::as_str)
+            .unwrap_or("m.file");
+        let Some(media_uri) = event.content.get("url").and_then(Value::as_str) else {
+            return self
+                .telegram
+                .send_text_with_reply(
+                    thread_id,
+                    "[Reddit media event has no downloadable URL]",
+                    reply_to_message_id,
+                )
+                .await;
+        };
+        if !media_uri.starts_with("mxc://") {
+            return self
+                .telegram
+                .send_text_with_reply(
+                    thread_id,
+                    &format!("[Reddit media] {media_uri}"),
+                    reply_to_message_id,
+                )
+                .await;
+        }
+
+        let declared_size = event
+            .content
+            .get("info")
+            .and_then(|info| info.get("size"))
+            .and_then(Value::as_u64);
+        if declared_size.is_some_and(|size| size > TELEGRAM_FILE_UPLOAD_LIMIT as u64) {
+            return self
+                .telegram
+                .send_text_with_reply(
+                    thread_id,
+                    &format!(
+                        "[Reddit media too large for Telegram Bot API: {}]",
+                        human_bytes(declared_size.unwrap_or_default())
+                    ),
+                    reply_to_message_id,
+                )
+                .await;
+        }
+
+        let (data, downloaded_mime) = self
+            .reddit
+            .download_media(media_uri, self.cfg.bridge.refresh_before_secs)
+            .await?;
+        if data.len() > TELEGRAM_FILE_UPLOAD_LIMIT {
+            return self
+                .telegram
+                .send_text_with_reply(
+                    thread_id,
+                    &format!(
+                        "[Reddit media too large for Telegram Bot API: {}]",
+                        human_bytes(data.len() as u64)
+                    ),
+                    reply_to_message_id,
+                )
+                .await;
+        }
+
+        let declared_mime = event
+            .content
+            .get("info")
+            .and_then(|info| info.get("mimetype"))
+            .and_then(Value::as_str)
+            .map(normalize_mime);
+        let mime_type = declared_mime
+            .filter(|mime| !mime.is_empty())
+            .unwrap_or_else(|| normalize_mime(&downloaded_mime));
+        let mime_type = if mime_type.is_empty() {
+            "application/octet-stream"
+        } else {
+            mime_type
+        };
+        let file_name = media_file_name(body, mime_type, msgtype);
+        let caption =
+            (!body.trim().is_empty() && body != "Image" && body != file_name).then_some(body);
+
+        let message_id = self
+            .telegram
+            .send_media_with_reply(
+                thread_id,
+                &data,
+                &file_name,
+                mime_type,
+                caption,
+                reply_to_message_id,
+            )
+            .await?;
+        Ok(vec![message_id])
     }
 
     async fn flush_pending_read_receipts(&self) -> Result<()> {
@@ -983,7 +1108,169 @@ impl Bridge {
         Ok(())
     }
 
+    async fn process_telegram_media_message(
+        &self,
+        update_id: i64,
+        message: &Message,
+    ) -> Result<()> {
+        let Some(thread_id) = message.message_thread_id else {
+            warn!(
+                message_id = message.message_id,
+                "Telegram media message has no message_thread_id; ignoring"
+            );
+            return Ok(());
+        };
+        let Some(room) = self.db.room_by_thread(thread_id)? else {
+            warn!(thread_id, "media arrived in an unmapped Telegram topic");
+            return Ok(());
+        };
+        if room.status == "invite" {
+            self.telegram
+                .send_text(thread_id, "Nejdřív napiš /accept nebo /decline.")
+                .await?;
+            return Ok(());
+        }
+        if room.status != "joined" {
+            return Ok(());
+        }
+
+        let Some(attachment) = message.image_attachment() else {
+            self.telegram
+                .send_text(
+                    thread_id,
+                    "Reddit Chat umí z Telegramu přijmout jen obrázky JPEG/PNG/GIF/WebP. Video, audio, PDF a jiné přílohy Reddit media endpoint odmítá.",
+                )
+                .await?;
+            return Ok(());
+        };
+        if attachment
+            .file_size
+            .is_some_and(|size| size > TELEGRAM_DOWNLOAD_LIMIT)
+        {
+            self.telegram
+                .send_text(
+                    thread_id,
+                    &format!(
+                        "Příloha má {} a Telegram Bot API dovoluje botovi stáhnout nejvýše 20 MiB.",
+                        human_bytes(attachment.file_size.unwrap_or_default())
+                    ),
+                )
+                .await?;
+            return Ok(());
+        }
+
+        let data = self.telegram.download_file(&attachment.file_id).await?;
+        let Some(mime_type) = detect_supported_image_mime(&data) else {
+            self.telegram
+                .send_text(
+                    thread_id,
+                    "Soubor není skutečný JPEG/PNG/GIF/WebP obrázek podporovaný Reddit Chatem.",
+                )
+                .await?;
+            return Ok(());
+        };
+        let Some(reddit_limit) = reddit_upload_limit(mime_type) else {
+            unreachable!("detected image MIME must have Reddit upload limit");
+        };
+        if data.len() > reddit_limit {
+            self.telegram
+                .send_text(
+                    thread_id,
+                    &format!(
+                        "Obrázek má {}, ale Reddit limit pro {} je {}.",
+                        human_bytes(data.len() as u64),
+                        mime_type,
+                        human_bytes(reddit_limit as u64)
+                    ),
+                )
+                .await?;
+            return Ok(());
+        }
+
+        let reply_to_event_id = if let Some(reply) = message.reply_to_message.as_ref() {
+            self.db
+                .matrix_event_for_telegram(thread_id, reply.message_id)?
+        } else {
+            None
+        };
+        let thread_root_event_id = if let Some(reply_to_event_id) = reply_to_event_id.as_deref() {
+            Some(
+                self.reddit
+                    .reply_thread_root(
+                        &room.matrix_room_id,
+                        reply_to_event_id,
+                        self.cfg.bridge.refresh_before_secs,
+                    )
+                    .await?,
+            )
+        } else {
+            None
+        };
+
+        let txn_id = format!("tg-{update_id}-{}-media", message.message_id);
+        let event_id = self
+            .reddit
+            .send_image(SendImageRequest {
+                room_id: &room.matrix_room_id,
+                data: &data,
+                file_name: &attachment.file_name,
+                mime_type,
+                width: attachment.width,
+                height: attachment.height,
+                txn_id: &txn_id,
+                thread_root_event_id: thread_root_event_id.as_deref(),
+                reply_to_event_id: reply_to_event_id.as_deref(),
+                refresh_before_secs: self.cfg.bridge.refresh_before_secs,
+            })
+            .await?;
+        self.db.record_telegram_delivery_kind(
+            &room.matrix_room_id,
+            &event_id,
+            thread_id,
+            message.message_id,
+            "image",
+        )?;
+
+        if let Some(caption) = attachment
+            .caption
+            .as_deref()
+            .map(str::trim)
+            .filter(|caption| !caption.is_empty())
+        {
+            let caption_event_id = self
+                .reddit
+                .send_text(
+                    &room.matrix_room_id,
+                    caption,
+                    &format!("tg-{update_id}-{}-caption", message.message_id),
+                    None,
+                    None,
+                    self.cfg.bridge.refresh_before_secs,
+                )
+                .await?;
+            self.db
+                .mark_matrix_event_seen(&caption_event_id, &room.matrix_room_id)?;
+        }
+
+        info!(
+            telegram_thread_id = thread_id,
+            telegram_message_id = message.message_id,
+            matrix_room_id = %room.matrix_room_id,
+            matrix_event_id = %event_id,
+            mime_type,
+            bytes = data.len(),
+            "Telegram image forwarded to Reddit"
+        );
+        Ok(())
+    }
+
     async fn process_telegram_message(&self, update_id: i64, message: &Message) -> Result<()> {
+        if message.text.is_none() && message.has_attachment() {
+            return self
+                .process_telegram_media_message(update_id, message)
+                .await;
+        }
+
         let Some(text) = message.text.as_deref() else {
             return Ok(());
         };
@@ -1252,6 +1539,48 @@ fn parse_history_command(input: &str) -> Option<std::result::Result<HistoryComma
         limit,
         dry_run,
     }))
+}
+
+fn normalize_mime(value: &str) -> &str {
+    value.split(';').next().unwrap_or(value).trim()
+}
+
+fn media_file_name(body: &str, mime_type: &str, msgtype: &str) -> String {
+    let body = body.trim();
+    if !body.is_empty() && body != "Image" && body.chars().count() <= 180 {
+        return body.to_owned();
+    }
+    let stem = match msgtype {
+        "m.image" => "image",
+        "m.video" => "video",
+        "m.audio" => "audio",
+        _ => "file",
+    };
+    format!("{stem}{}", media_extension(mime_type))
+}
+
+fn media_extension(mime_type: &str) -> &'static str {
+    match mime_type {
+        "image/jpeg" => ".jpg",
+        "image/png" => ".png",
+        "image/gif" => ".gif",
+        "image/webp" => ".webp",
+        "video/mp4" => ".mp4",
+        "audio/mpeg" => ".mp3",
+        "audio/ogg" => ".ogg",
+        "application/pdf" => ".pdf",
+        _ => "",
+    }
+}
+
+fn human_bytes(bytes: u64) -> String {
+    if bytes >= 1 << 20 {
+        format!("{:.1} MiB", bytes as f64 / (1u64 << 20) as f64)
+    } else if bytes >= 1 << 10 {
+        format!("{:.1} KiB", bytes as f64 / (1u64 << 10) as f64)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 fn clean_name(value: &str) -> String {

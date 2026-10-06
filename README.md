@@ -9,6 +9,9 @@ The target deployment is Linux/Devuan without Rust, Cargo, a system OpenSSL inst
 ### Messaging and conversation mapping
 
 - bidirectional Reddit Chat text/notice relay: Reddit -> Telegram and Telegram -> Reddit
+- live image bridging in both directions: Reddit `m.image` media is downloaded from Reddit Matrix/CDN and uploaded to Telegram; Telegram photos and image documents are downloaded through Bot API, validated by file signature, uploaded to Reddit Matrix media, and sent as `m.image`
+- Reddit upload supports JPEG, PNG, GIF and WebP; Telegram -> Reddit rejects unsupported video/audio/PDF/other attachments with a readable topic message instead of retrying forever
+- Telegram media captions are forwarded to Reddit as a following text message because Reddit's native image event shape uses `body: "Image"` rather than a caption field
 - one Reddit Matrix room maps to one topic in a private Telegram forum supergroup
 - Reddit message requests become `REQUEST · <name>` topics and can be handled with `/accept` or `/decline`
 - Telegram messages are accepted only from the configured `telegram.operator_user_id`
@@ -61,9 +64,11 @@ The default history limit is 50 text/notice messages and the accepted maximum is
 
 ### Current limitations
 
-Not implemented yet: media/file transfer, reactions, edits/deletes, typing indicators, starting a brand-new Reddit DM from Telegram, or reliable counterparty "seen" receipts. Reddit does not expose dependable remote-user read receipts through the Matrix sync stream, and the Telegram Bot API does not tell a bot when a human has opened a message.
+Not implemented yet: reactions, edits/deletes, typing indicators, starting a brand-new Reddit DM from Telegram, or reliable counterparty "seen" receipts. Reddit does not expose dependable remote-user read receipts through the Matrix sync stream, and the Telegram Bot API does not tell a bot when a human has opened a message.
 
-History recovery currently replays text/notice events only; media events are skipped until media bridging is implemented.
+Reddit's upload endpoint accepts images only (JPEG/PNG/WebP up to 20 MiB, GIF up to 100 MiB). The standard Telegram Bot API can download incoming user files only up to 20 MiB and upload at most 10 MiB as a photo or 50 MiB as another file, so larger media cannot be bridged through the hosted Bot API.
+
+History recovery still replays text/notice events only; live media bridging is implemented, but `/reload-history` and `/reset-chat` do not yet replay historical media.
 
 ## Configuration values
 
