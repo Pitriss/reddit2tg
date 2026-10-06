@@ -1,0 +1,21 @@
+[Unit]
+Description=Reddit Chat to Telegram bridge
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=reddit2tg
+Group=reddit2tg
+ExecStart=/usr/bin/reddit2tg --config /etc/reddit2tg/config.toml run
+Restart=on-failure
+RestartSec=5s
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/reddit2tg
+
+[Install]
+WantedBy=multi-user.target
