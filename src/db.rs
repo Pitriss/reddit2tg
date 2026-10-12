@@ -599,6 +599,15 @@ impl Db {
         u64::try_from(generation).context("negative HA replication generation in SQLite")
     }
 
+    pub fn replication_published_seq(&self) -> Result<i64> {
+        let conn = self.connect()?;
+        Ok(conn.query_row(
+            "SELECT published_seq FROM ha_replication_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn pending_replication_changes(&self, limit: usize) -> Result<Vec<ReplicationChange>> {
         if limit == 0 {
             return Ok(Vec::new());

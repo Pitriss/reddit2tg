@@ -36,7 +36,6 @@ const REPLICATION_DELTA_CHANGE_LIMIT: usize = 512;
 const REPLICATION_MAX_CHAIN: usize = 10_000;
 const TELEGRAM_FILE_DOWNLOAD_LIMIT: usize = 20 * 1024 * 1024;
 const CONTROL_CLAIM_STAGGER_MS: i64 = 1_000;
-const CONTROL_WRITE_RETRIES: usize = 8;
 const MAX_CONTROL_RATE_LIMIT_RETRIES: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -349,6 +348,8 @@ pub struct HaController {
     claim_cooldown_until_ms: Arc<Mutex<i64>>,
     state_message_id: Arc<Mutex<Option<i64>>>,
     sync_thread_id_cache: Arc<Mutex<Option<i64>>>,
+    document_high_water: Arc<Mutex<Option<PinnedDocument>>>,
+    uncertain_document_write: Arc<Mutex<Option<PinnedDocument>>>,
     document_write_lock: Arc<Mutex<()>>,
     replication_lock: Arc<Mutex<()>>,
     last_replication_flush_ms: Arc<Mutex<i64>>,
@@ -934,6 +935,8 @@ impl HaController {
             claim_cooldown_until_ms: Arc::new(Mutex::new(0)),
             state_message_id: Arc::new(Mutex::new(None)),
             sync_thread_id_cache: Arc::new(Mutex::new(None)),
+            document_high_water: Arc::new(Mutex::new(None)),
+            uncertain_document_write: Arc::new(Mutex::new(None)),
             document_write_lock: Arc::new(Mutex::new(())),
             replication_lock: Arc::new(Mutex::new(())),
             last_replication_flush_ms: Arc::new(Mutex::new(0)),
@@ -1417,6 +1420,14 @@ impl HaController {
             if document.replication_epoch.is_none() {
                 return Ok(());
             }
+        }
+
+        if self
+            .recover_local_ahead_replication_locked(db, &document)
+            .await?
+        {
+            *self.last_replication_flush_ms.lock().await = now_ms();
+            return Ok(());
         }
 
         let owned_active =
@@ -1976,6 +1987,136 @@ impl HaController {
         Ok(ids)
     }
 
+    async fn recover_local_ahead_replication_locked(
+        &self,
+        db: &Db,
+        document: &HaDocument,
+    ) -> Result<bool> {
+        let Some(epoch) = document.replication_epoch.as_deref() else {
+            return Ok(false);
+        };
+        if db.get_meta(REPLICATION_EPOCH_META)?.as_deref() != Some(epoch) {
+            return Ok(false);
+        }
+
+        let local_generation = db.replication_generation()?;
+        if local_generation <= document.replication_generation {
+            return Ok(false);
+        }
+
+        let published_seq = db.replication_published_seq()?;
+        if !local_ahead_recovery_candidate(
+            local_generation,
+            document.replication_generation,
+            published_seq,
+        ) {
+            bail!(
+                "local HA replication generation is ahead of canonical state but is not a safe one-generation publisher recovery candidate: local={}, cluster={}, published_seq={}",
+                local_generation,
+                document.replication_generation,
+                published_seq
+            );
+        }
+
+        let now = now_ms();
+        if document.owner_is_live(now)
+            || document.claim_is_live(now)
+            || foreign_live_control_owner(document, &self.cfg.instance_id, &self.nonce, now)
+        {
+            bail!(
+                "local HA replication generation is ahead of canonical state while a HA lease is still live: local={}, cluster={}; waiting for lease expiry instead of rolling back",
+                local_generation,
+                document.replication_generation
+            );
+        }
+        if claim_rank(&self.cfg, document, now, &self.cfg.instance_id) != Some(0) {
+            bail!(
+                "local HA replication generation is ahead of canonical state, but this instance is not the highest-priority eligible recovery node: local={}, cluster={}",
+                local_generation,
+                document.replication_generation
+            );
+        }
+
+        let thread_id = document
+            .sync_thread_id
+            .context("local-ahead HA recovery has no ha-sync topic")?;
+        let (snapshot, baseline_through_seq) = db.export_replication_snapshot_with_watermark()?;
+        if snapshot.generation != local_generation {
+            bail!("local-ahead HA recovery snapshot generation changed during export");
+        }
+
+        let recovery_epoch = random_epoch()?;
+        let uploaded_snapshot = self
+            .upload_snapshot(thread_id, &recovery_epoch, &snapshot)
+            .await?;
+        let local_telegram_offset = db
+            .get_meta("telegram_offset")?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+
+        let expected_epoch = epoch.to_owned();
+        let expected_generation = document.replication_generation;
+        let expected_snapshot = document.replication_snapshot.clone();
+        let expected_head = document.replication_head.clone();
+        let expected_previous_snapshot = document.replication_previous_snapshot.clone();
+        let expected_previous_head = document.replication_previous_head.clone();
+        let expected_gc = document.replication_gc.clone();
+
+        let updated = self
+            .update_document(|current| {
+                let now = now_ms();
+                if current.owner_is_live(now)
+                    || current.claim_is_live(now)
+                    || foreign_live_control_owner(current, &self.cfg.instance_id, &self.nonce, now)
+                {
+                    bail!("HA lease became live during local-ahead replication recovery");
+                }
+                if claim_rank(&self.cfg, current, now, &self.cfg.instance_id) != Some(0) {
+                    bail!("HA recovery priority changed during local-ahead replication recovery");
+                }
+                if current.replication_epoch.as_deref() != Some(expected_epoch.as_str())
+                    || current.replication_generation != expected_generation
+                    || current.replication_snapshot != expected_snapshot
+                    || current.replication_head != expected_head
+                    || current.replication_previous_snapshot != expected_previous_snapshot
+                    || current.replication_previous_head != expected_previous_head
+                    || current.replication_gc != expected_gc
+                {
+                    bail!("canonical HA replication state changed during local-ahead recovery");
+                }
+
+                current.replication_epoch = Some(recovery_epoch.clone());
+                current.replication_generation = snapshot.generation;
+                current.replication_head = None;
+                current.replication_snapshot = Some(uploaded_snapshot.clone());
+                current.replication_previous_snapshot = None;
+                current.replication_previous_head = None;
+                current.replication_gc = None;
+                current.data_update_offset = current.data_update_offset.max(local_telegram_offset);
+                Ok(())
+            })
+            .await?;
+
+        if updated.replication_epoch.as_deref() != Some(recovery_epoch.as_str())
+            || updated.replication_generation != snapshot.generation
+            || updated.replication_snapshot.as_ref() != Some(&uploaded_snapshot)
+            || updated.replication_head.is_some()
+        {
+            bail!("local-ahead HA recovery snapshot was not committed as canonical baseline");
+        }
+
+        db.establish_replication_baseline(snapshot.generation, baseline_through_seq)?;
+        db.set_meta(REPLICATION_EPOCH_META, &recovery_epoch)?;
+        warn!(
+            instance_id = %self.cfg.instance_id,
+            previous_replication_generation = expected_generation,
+            replication_generation = snapshot.generation,
+            published_seq = baseline_through_seq,
+            "HA local-ahead state recovered into a fresh replication epoch"
+        );
+        Ok(true)
+    }
+
     async fn catch_up_replication_locked(&self, db: &Db, document: &HaDocument) -> Result<()> {
         let epoch = document
             .replication_epoch
@@ -1993,9 +2134,18 @@ impl HaController {
             .as_ref()
             .context("HA replication snapshot is missing")?;
 
+        if local_epoch.as_deref() == Some(epoch)
+            && local_generation > document.replication_generation
+        {
+            bail!(
+                "local HA replication generation is ahead of canonical state: local={}, cluster={}; refusing automatic rollback",
+                local_generation,
+                document.replication_generation
+            );
+        }
+
         let must_restore_snapshot = local_epoch.as_deref() != Some(epoch)
             || pending_local_changes
-            || local_generation > document.replication_generation
             || local_generation < current_snapshot.generation;
 
         if must_restore_snapshot {
@@ -3395,10 +3545,7 @@ impl HaController {
             } else {
                 pinned
             };
-            self.validate_document(&pinned.document)?;
-            *self.state_message_id.lock().await = Some(pinned.message_id);
-            *self.sync_thread_id_cache.lock().await = pinned.document.sync_thread_id;
-            return Ok(pinned);
+            return self.accept_document(pinned).await;
         }
 
         let document = HaDocument::new(&self.cfg, now_ms());
@@ -3410,10 +3557,7 @@ impl HaController {
         let pinned = self.api.read_pinned().await?.context(
             "HA control state was sent into ha-control-room and pinned but getChat returned no pinned message",
         )?;
-        self.validate_document(&pinned.document)?;
-        *self.state_message_id.lock().await = Some(pinned.message_id);
-        *self.sync_thread_id_cache.lock().await = pinned.document.sync_thread_id;
-        Ok(pinned)
+        self.accept_document(pinned).await
     }
 
     async fn migrate_legacy_document(&self, pinned: PinnedDocument) -> Result<PinnedDocument> {
@@ -3496,13 +3640,48 @@ impl HaController {
         Ok(migrated)
     }
 
+    async fn accept_document(&self, pinned: PinnedDocument) -> Result<PinnedDocument> {
+        self.validate_document(&pinned.document)?;
+
+        // Telegram getChat can briefly serve an older cached pinned message after
+        // editMessageText. Once this process has observed a canonical generation,
+        // never allow a later writer to build on an older generation or on a
+        // different document with the same generation.
+        let mut uncertain = self.uncertain_document_write.lock().await;
+        let mut high_water = self.document_high_water.lock().await;
+
+        if let Some(expected) = uncertain.as_ref() {
+            validate_control_document_progress(expected, &pinned, "unresolved control write")?;
+        }
+        if let Some(confirmed) = high_water.as_ref() {
+            validate_control_document_progress(confirmed, &pinned, "confirmed control state")?;
+        }
+
+        if uncertain
+            .as_ref()
+            .is_some_and(|expected| pinned.document.generation >= expected.document.generation)
+        {
+            *uncertain = None;
+        }
+        if high_water
+            .as_ref()
+            .is_none_or(|confirmed| pinned.document.generation > confirmed.document.generation)
+        {
+            *high_water = Some(pinned.clone());
+        }
+
+        drop(high_water);
+        drop(uncertain);
+
+        *self.state_message_id.lock().await = Some(pinned.message_id);
+        *self.sync_thread_id_cache.lock().await = pinned.document.sync_thread_id;
+        Ok(pinned)
+    }
+
     async fn read_document(&self) -> Result<PinnedDocument> {
         match self.api.read_pinned().await {
             Ok(Some(pinned)) => {
-                self.validate_document(&pinned.document)?;
-                *self.state_message_id.lock().await = Some(pinned.message_id);
-                *self.sync_thread_id_cache.lock().await = pinned.document.sync_thread_id;
-                return Ok(pinned);
+                return self.accept_document(pinned).await;
             }
             Ok(None) => {}
             Err(first_error) => {
@@ -3519,10 +3698,7 @@ impl HaController {
                         .read_pinned()
                         .await?
                         .context("cached HA state message was re-pinned but getChat returned no pinned message")?;
-                    self.validate_document(&pinned.document)?;
-                    *self.state_message_id.lock().await = Some(pinned.message_id);
-                    *self.sync_thread_id_cache.lock().await = pinned.document.sync_thread_id;
-                    return Ok(pinned);
+                    return self.accept_document(pinned).await;
                 }
                 return Err(first_error);
             }
@@ -3535,45 +3711,46 @@ impl HaController {
     where
         F: FnMut(&mut HaDocument) -> Result<()>,
     {
-        // Keep the whole read->edit->verify retry sequence serialized locally.
-        // Telegram getChat may briefly return the pre-edit pinned document after
-        // a successful editMessageText; releasing this mutex before verification
-        // would let another local writer build on stale state and clobber a write.
+        // Serialize local writers, and never retry a write from an older
+        // read-after-write image. Telegram has no compare-and-swap primitive:
+        // once editMessageText reports success the edit did commit, while a
+        // later getChat may still briefly return an older cached document.
         let _write_guard = self.document_write_lock.lock().await;
-        let mut last_written: Option<(i64, HaDocument)> = None;
+        let pinned = self.read_document().await?;
 
-        for attempt in 0..CONTROL_WRITE_RETRIES {
-            let pinned = self.read_document().await?;
+        let mut next = pinned.document.clone();
+        mutate(&mut next)?;
 
-            // Telegram getChat can briefly lag behind a successful editMessageText.
-            // If a retry finally observes the exact document written by the
-            // previous attempt, treat that write as committed instead of running
-            // the mutation against our own already-committed state.
-            if let Some((message_id, expected)) = last_written.as_ref() {
-                if pinned.message_id == *message_id && &pinned.document == expected {
-                    return Ok(pinned.document);
+        if next == pinned.document {
+            return Ok(next);
+        }
+
+        next.generation = pinned.document.generation.saturating_add(1);
+        next.written_at_ms = now_ms();
+
+        let attempted = PinnedDocument {
+            message_id: pinned.message_id,
+            document: next.clone(),
+        };
+
+        match self.api.edit_document(pinned.message_id, &next).await {
+            Ok(()) => {
+                // A successful editMessageText response is the commit
+                // acknowledgement. Record it immediately as the local
+                // high-water mark; do not let a stale getChat verification
+                // move this process back behind a write Telegram accepted.
+                self.accept_document(attempted).await?;
+                Ok(next)
+            }
+            Err(edit_error) => {
+                // Transport/deadline failures are ambiguous: Telegram may have
+                // committed the edit while only the HTTP response was lost.
+                // Fence later writers at the attempted generation until a
+                // canonical read proves the outcome.
+                if control_write_error_may_have_committed(&edit_error) {
+                    *self.uncertain_document_write.lock().await = Some(attempted);
                 }
-            }
 
-            let mut next = pinned.document.clone();
-            mutate(&mut next)?;
-
-            if next == pinned.document {
-                return Ok(next);
-            }
-
-            next.generation = pinned.document.generation.saturating_add(1);
-            next.written_at_ms = now_ms();
-
-            let edit_result = self.api.edit_document(pinned.message_id, &next).await;
-            *self.state_message_id.lock().await = Some(pinned.message_id);
-            last_written = Some((pinned.message_id, next.clone()));
-
-            if let Err(edit_error) = edit_result {
-                // A request timeout is ambiguous: Telegram can commit the edit
-                // and lose/delay only the HTTP response. Verify canonical state
-                // once before surfacing the error so callers do not leave local
-                // SQLite behind a write that actually became authoritative.
                 sleep(Duration::from_millis(120)).await;
                 match self.read_document().await {
                     Ok(verify)
@@ -3585,31 +3762,17 @@ impl HaController {
                             generation = next.generation,
                             "HA control write returned an error but read-back confirms commit"
                         );
-                        return Ok(next);
+                        Ok(next)
                     }
-                    Ok(_) => {
-                        return Err(edit_error).context(
-                            "HA control document write failed and read-back did not confirm commit",
-                        );
-                    }
-                    Err(verify_error) => {
-                        bail!(
-                            "HA control document write failed: {edit_error:#}; read-back verification failed: {verify_error:#}"
-                        );
-                    }
+                    Ok(_) => Err(edit_error).context(
+                        "HA control document write failed and read-back did not confirm commit",
+                    ),
+                    Err(verify_error) => bail!(
+                        "HA control document write failed: {edit_error:#}; read-back verification failed: {verify_error:#}"
+                    ),
                 }
             }
-
-            sleep(Duration::from_millis(120)).await;
-            let verify = self.read_document().await?;
-            if control_write_readback_matches(&verify, pinned.message_id, &next) {
-                return Ok(next);
-            }
-
-            sleep(Duration::from_millis(80 * (attempt as u64 + 1))).await;
         }
-
-        bail!("HA control document update lost concurrent writes too many times")
     }
 
     fn validate_document(&self, document: &HaDocument) -> Result<()> {
@@ -3650,6 +3813,62 @@ where
         result = &mut admin => result.context("HA admin runtime loop stopped"),
         result = &mut replication => result.context("HA replication runtime loop stopped"),
     }
+}
+
+fn local_ahead_recovery_candidate(
+    local_generation: u64,
+    canonical_generation: u64,
+    published_seq: i64,
+) -> bool {
+    published_seq > 0 && local_generation == canonical_generation.saturating_add(1)
+}
+
+fn foreign_live_control_owner(
+    document: &HaDocument,
+    instance_id: &str,
+    nonce: &str,
+    now_ms: i64,
+) -> bool {
+    document.control_owner_is_live(now_ms)
+        && (document.control_owner.as_deref() != Some(instance_id)
+            || document.control_owner_nonce.as_deref() != Some(nonce))
+}
+
+fn validate_control_document_progress(
+    reference: &PinnedDocument,
+    incoming: &PinnedDocument,
+    reference_kind: &str,
+) -> Result<()> {
+    if incoming.message_id != reference.message_id {
+        bail!(
+            "HA control document message changed while enforcing {reference_kind}: expected={}, observed={}",
+            reference.message_id,
+            incoming.message_id
+        );
+    }
+    if incoming.document.generation < reference.document.generation {
+        bail!(
+            "HA control document read regressed below {reference_kind}: expected_generation_at_least={}, observed_generation={}",
+            reference.document.generation,
+            incoming.document.generation
+        );
+    }
+    if incoming.document.generation == reference.document.generation
+        && incoming.document != reference.document
+    {
+        bail!(
+            "HA control document fork detected at generation {} while enforcing {reference_kind}",
+            incoming.document.generation
+        );
+    }
+    Ok(())
+}
+
+fn control_write_error_may_have_committed(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_ascii_lowercase();
+    text.contains("control deadline")
+        || text.contains("timed out")
+        || text.contains("error sending request")
 }
 
 fn control_write_readback_matches(
@@ -4385,6 +4604,146 @@ mod tests {
             ticks >= 8,
             "lease runtime was starved by slow replication: only {ticks} ticks observed"
         );
+    }
+
+    #[test]
+    fn local_ahead_recovery_requires_exactly_one_published_generation() {
+        assert!(local_ahead_recovery_candidate(108, 107, 137));
+        assert!(!local_ahead_recovery_candidate(109, 107, 137));
+        assert!(!local_ahead_recovery_candidate(107, 107, 137));
+        assert!(!local_ahead_recovery_candidate(108, 107, 0));
+    }
+
+    #[test]
+    fn local_ahead_recovery_allows_own_control_lease_but_blocks_foreign_control() {
+        let cfg = cfg();
+        let mut document = HaDocument::new(&cfg, 1_000);
+        document.control_owner = Some("ostrava".to_owned());
+        document.control_owner_nonce = Some("this-process".to_owned());
+        document.control_lease_expires_at_ms = 31_000;
+
+        assert!(!foreign_live_control_owner(
+            &document,
+            "ostrava",
+            "this-process",
+            2_000
+        ));
+        assert!(foreign_live_control_owner(
+            &document,
+            "ostrava",
+            "other-process",
+            2_000
+        ));
+
+        document.control_owner = Some("brno".to_owned());
+        document.control_owner_nonce = Some("brno-process".to_owned());
+        assert!(foreign_live_control_owner(
+            &document,
+            "ostrava",
+            "this-process",
+            2_000
+        ));
+
+        document.control_lease_expires_at_ms = 1_500;
+        assert!(!foreign_live_control_owner(
+            &document,
+            "ostrava",
+            "this-process",
+            2_000
+        ));
+    }
+
+    #[test]
+    fn control_document_progress_rejects_older_cached_generation() {
+        let cfg = cfg();
+        let mut confirmed = HaDocument::new(&cfg, 100);
+        confirmed.generation = 602;
+        confirmed.replication_generation = 108;
+
+        let mut stale = confirmed.clone();
+        stale.generation = 601;
+        stale.replication_generation = 107;
+
+        let confirmed = PinnedDocument {
+            message_id: 721,
+            document: confirmed,
+        };
+        let stale = PinnedDocument {
+            message_id: 721,
+            document: stale,
+        };
+
+        let error =
+            validate_control_document_progress(&confirmed, &stale, "confirmed control state")
+                .expect_err("older cached document must be rejected");
+        assert!(format!("{error:#}").contains("regressed"));
+    }
+
+    #[test]
+    fn control_document_progress_rejects_same_generation_fork() {
+        let cfg = cfg();
+        let mut confirmed = HaDocument::new(&cfg, 100);
+        confirmed.generation = 602;
+        confirmed.replication_generation = 108;
+
+        let mut fork = confirmed.clone();
+        fork.replication_generation = 107;
+
+        let confirmed = PinnedDocument {
+            message_id: 721,
+            document: confirmed,
+        };
+        let fork = PinnedDocument {
+            message_id: 721,
+            document: fork,
+        };
+
+        let error =
+            validate_control_document_progress(&confirmed, &fork, "confirmed control state")
+                .expect_err("same-generation divergent document must be rejected");
+        assert!(format!("{error:#}").contains("fork detected"));
+    }
+
+    #[test]
+    fn control_document_progress_accepts_exact_and_newer_state() {
+        let cfg = cfg();
+        let mut confirmed_doc = HaDocument::new(&cfg, 100);
+        confirmed_doc.generation = 602;
+        confirmed_doc.replication_generation = 108;
+
+        let confirmed = PinnedDocument {
+            message_id: 721,
+            document: confirmed_doc.clone(),
+        };
+        let exact = confirmed.clone();
+
+        let mut newer_doc = confirmed_doc;
+        newer_doc.generation = 603;
+        newer_doc.replication_generation = 109;
+        let newer = PinnedDocument {
+            message_id: 721,
+            document: newer_doc,
+        };
+
+        validate_control_document_progress(&confirmed, &exact, "confirmed control state")
+            .expect("exact canonical state should be accepted");
+        validate_control_document_progress(&confirmed, &newer, "confirmed control state")
+            .expect("newer canonical state should be accepted");
+    }
+
+    #[test]
+    fn ambiguous_transport_errors_are_treated_as_possible_commits() {
+        let timeout =
+            anyhow::anyhow!("HA Telegram editMessageText request failed: operation timed out");
+        assert!(control_write_error_may_have_committed(&timeout));
+
+        let deadline =
+            anyhow::anyhow!("HA Telegram editMessageText call exceeded control deadline of 4s");
+        assert!(control_write_error_may_have_committed(&deadline));
+
+        let rejected =
+            anyhow::anyhow!("HA Telegram editMessageText failed (HTTP 400): Bad Request");
+        assert!(!control_write_error_may_have_committed(&rejected));
     }
 
     #[test]
