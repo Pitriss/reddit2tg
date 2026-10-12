@@ -1543,8 +1543,27 @@ impl HaController {
         let nonce = self.nonce.to_string();
         let expected_epoch = epoch.to_owned();
         let expected_previous_generation = document.replication_generation;
+        let committed_head = ReplicationHeadRef {
+            generation: delta.generation,
+            file_id: sent.file_id.clone(),
+            message_id: sent.message_id,
+            sha256: sealed_sha256.clone(),
+        };
         let committed = self
             .update_document(|current| {
+                // A successful Telegram edit can become visible only after our
+                // first read-after-write verification. Recognize the exact delta
+                // uploaded by this attempt before checking current ownership so
+                // the local SQLite generation can be finalized even if the lease
+                // expired immediately after the canonical write.
+                if replication_delta_attempt_is_canonical(
+                    current,
+                    &expected_epoch,
+                    delta.generation,
+                    &committed_head,
+                ) {
+                    return Ok(());
+                }
                 if current.owner.as_deref() != Some(instance_id.as_str())
                     || current.owner_nonce.as_deref() != Some(nonce.as_str())
                     || !current.owner_is_live(now_ms())
@@ -1557,12 +1576,7 @@ impl HaController {
                     bail!("HA replication head changed before delta commit");
                 }
                 current.replication_generation = delta.generation;
-                current.replication_head = Some(ReplicationHeadRef {
-                    generation: delta.generation,
-                    file_id: sent.file_id.clone(),
-                    message_id: sent.message_id,
-                    sha256: sealed_sha256.clone(),
-                });
+                current.replication_head = Some(committed_head.clone());
                 Ok(())
             })
             .await?;
@@ -3426,9 +3440,21 @@ impl HaController {
         // local lease-renewal task and data/control offset writers can race
         // each other through Telegram's non-CAS editMessageText API.
         let _write_guard = self.document_write_lock.lock().await;
+        let mut last_written: Option<(i64, HaDocument)> = None;
 
         for attempt in 0..CONTROL_WRITE_RETRIES {
             let pinned = self.read_document().await?;
+
+            // Telegram getChat can briefly lag behind a successful editMessageText.
+            // If a retry finally observes the exact document written by the
+            // previous attempt, treat that write as committed instead of running
+            // the mutation against our own already-committed state.
+            if let Some((message_id, expected)) = last_written.as_ref() {
+                if pinned.message_id == *message_id && &pinned.document == expected {
+                    return Ok(pinned.document);
+                }
+            }
+
             let mut next = pinned.document.clone();
             mutate(&mut next)?;
 
@@ -3440,6 +3466,7 @@ impl HaController {
             next.written_at_ms = now_ms();
             self.api.edit_document(pinned.message_id, &next).await?;
             *self.state_message_id.lock().await = Some(pinned.message_id);
+            last_written = Some((pinned.message_id, next.clone()));
 
             sleep(Duration::from_millis(120)).await;
             let verify = self.read_document().await?;
@@ -3654,6 +3681,17 @@ pub fn members_fingerprint(cfg: &HaConfig) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{hash:016x}")
+}
+
+fn replication_delta_attempt_is_canonical(
+    document: &HaDocument,
+    epoch: &str,
+    generation: u64,
+    head: &ReplicationHeadRef,
+) -> bool {
+    document.replication_epoch.as_deref() == Some(epoch)
+        && document.replication_generation == generation
+        && document.replication_head.as_ref() == Some(head)
 }
 
 fn replication_snapshot_due(cfg: &HaConfig, document: &HaDocument, now_ms: i64) -> bool {
@@ -4037,6 +4075,47 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn canonical_delta_retry_recognizes_own_prior_commit() {
+        let cfg = cfg();
+        let mut document = HaDocument::new(&cfg, 1);
+        let head = ReplicationHeadRef {
+            generation: 15,
+            file_id: "file-15".to_owned(),
+            message_id: 815,
+            sha256: "sha-15".to_owned(),
+        };
+
+        document.replication_epoch = Some("epoch-1".to_owned());
+        document.replication_generation = 15;
+        document.replication_head = Some(head.clone());
+
+        // Ownership is deliberately unrelated here: once the exact uploaded
+        // delta is canonical, the publisher may safely finalize its local
+        // generation even if lease ownership changed immediately afterwards.
+        document.owner = Some("brno".to_owned());
+        document.owner_nonce = Some("other-process".to_owned());
+
+        assert!(replication_delta_attempt_is_canonical(
+            &document, "epoch-1", 15, &head
+        ));
+        assert!(!replication_delta_attempt_is_canonical(
+            &document, "epoch-2", 15, &head
+        ));
+        assert!(!replication_delta_attempt_is_canonical(
+            &document, "epoch-1", 14, &head
+        ));
+
+        let mut wrong_head = head.clone();
+        wrong_head.sha256 = "different".to_owned();
+        assert!(!replication_delta_attempt_is_canonical(
+            &document,
+            "epoch-1",
+            15,
+            &wrong_head
+        ));
     }
 
     fn temp_replication_db(label: &str) -> Db {
