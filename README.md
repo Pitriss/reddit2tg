@@ -1051,3 +1051,23 @@ The `amd64` MUSL build has been verified locally on Debian 13 as a static-PIE ex
 Version 0.1.5 retains the INFO-level diagnostics from 0.1.4 and adds authentication refresh/read-marker diagnostics. Version 0.1.4 keeps the INFO-level diagnostics for Telegram forum-topic routing and also resolves missing DM identities through Matrix `joined_members`. Existing generic `Reddit chat` topics are renamed automatically when the Reddit identity becomes available. Successful Telegram -> Reddit sends now log the resulting Matrix event ID. Version 0.1.3 added the original topic diagnostics. When a Reddit room creates a topic, the log prints both `matrix_room_id` and the returned `telegram_thread_id`. When the operator replies in Telegram, the log prints the incoming `message_thread_id` and `is_topic_message`. `sendMessage` also warns if Telegram returns a different or missing thread ID than the one requested.
 
 This makes it possible to verify that the SQLite mapping and Telegram's actual topic IDs match.
+
+<!-- ha-v3-replication-foundation -->
+### HA protocol 3 state replication
+
+The `feature/ha-replicated-state` development branch introduces a logical
+replication layer for bridge state. It intentionally does **not** replicate the
+SQLite file itself and does not replicate `matrix_auth` access tokens.
+
+Replicated state includes room/topic mappings, Matrix event deduplication,
+message mappings, reply edges, message snapshots, per-room delete policy,
+profile intro message IDs, archived topics, pending read receipts and
+`matrix_next_batch`.
+
+SQLite triggers append those logical changes atomically to a local HA change
+log. Standby nodes will consume published generations and apply them with
+replication logging suppressed. Full logical snapshots provide bootstrap and
+recovery without sharing SQLite over NFS.
+
+Protocol 3 nodes must not be mixed with protocol 2 (`v0.4.0-alpha1`) nodes in
+one running cluster.

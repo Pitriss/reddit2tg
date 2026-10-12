@@ -46,6 +46,13 @@ enabled = false
 # claim_settle_secs = 5
 # fail_closed_margin_secs = 5
 #
+# HA protocol 3 replicates logical bridge state between nodes. Matrix auth
+# tokens are deliberately local and are never included in replication.
+# replicate_state = true
+# replication_batch_ms = 2000
+# replication_snapshot_every = 100
+# replication_snapshot_chunk_mib = 8
+#
 # [[ha.instances]]
 # id = "ostrava"
 # priority = 10

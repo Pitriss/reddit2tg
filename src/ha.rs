@@ -20,8 +20,8 @@ use crate::{
     reddit::RedditClient,
 };
 
-pub const HA_PROTOCOL_VERSION: u32 = 2;
-pub const HA_CONTROL_PREFIX: &str = "reddit2tg-ha-v2\n";
+pub const HA_PROTOCOL_VERSION: u32 = 3;
+pub const HA_CONTROL_PREFIX: &str = "reddit2tg-ha-v3\n";
 pub const HA_CONTROL_TOPIC_NAME: &str = "ha-control-room";
 const CONTROL_POLL_SECS: u64 = 2;
 const CONTROL_CLAIM_STAGGER_MS: i64 = 1_000;
@@ -89,6 +89,13 @@ pub struct HaRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicationFilePart {
+    pub file_id: String,
+    pub sha256: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HaDocument {
     pub protocol: u32,
     pub cluster_id: String,
@@ -123,6 +130,16 @@ pub struct HaDocument {
     pub control_update_offset: i64,
     #[serde(default)]
     pub data_update_offset: i64,
+    #[serde(default)]
+    pub replication_generation: u64,
+    #[serde(default)]
+    pub replication_head_file_id: Option<String>,
+    #[serde(default)]
+    pub replication_head_sha256: Option<String>,
+    #[serde(default)]
+    pub replication_snapshot_generation: u64,
+    #[serde(default)]
+    pub replication_snapshot_parts: Vec<ReplicationFilePart>,
 }
 
 impl HaDocument {
@@ -155,6 +172,11 @@ impl HaDocument {
             control_lease_expires_at_ms: now_ms,
             control_update_offset: 0,
             data_update_offset: 0,
+            replication_generation: 0,
+            replication_head_file_id: None,
+            replication_head_sha256: None,
+            replication_snapshot_generation: 0,
+            replication_snapshot_parts: Vec::new(),
         }
     }
 
@@ -236,6 +258,7 @@ pub struct HaController {
     lease_expires_at_ms: Arc<Mutex<i64>>,
     claim_cooldown_until_ms: Arc<Mutex<i64>>,
     state_message_id: Arc<Mutex<Option<i64>>>,
+    document_write_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -586,6 +609,7 @@ impl HaController {
             lease_expires_at_ms: Arc::new(Mutex::new(0)),
             claim_cooldown_until_ms: Arc::new(Mutex::new(0)),
             state_message_id: Arc::new(Mutex::new(None)),
+            document_write_lock: Arc::new(Mutex::new(())),
         }))
     }
 
@@ -638,10 +662,30 @@ impl HaController {
             return None;
         }
 
-        let expires_at_ms = *self.lease_expires_at_ms.lock().await;
-        let safe_until_ms =
-            expires_at_ms.saturating_sub((self.cfg.fail_closed_margin_secs as i64) * 1000);
+        // The local expiry cache is only an optimization. Another node may
+        // have replaced the canonical Telegram document after our previous
+        // successful write, so verify ownership before every new active
+        // bridge operation.
+        let canonical = match self.read_document().await {
+            Ok(pinned) => pinned.document,
+            Err(error) => {
+                warn!(
+                    error = %format!("{error:#}"),
+                    instance_id = %self.cfg.instance_id,
+                    "HA active permit denied because canonical lease could not be verified"
+                );
+                return None;
+            }
+        };
         let now = now_ms();
+        if !self.owned_by_this_process(&canonical) || !canonical.owner_is_live(now) {
+            return None;
+        }
+
+        *self.lease_expires_at_ms.lock().await = canonical.lease_expires_at_ms;
+        let safe_until_ms = canonical
+            .lease_expires_at_ms
+            .saturating_sub((self.cfg.fail_closed_margin_secs as i64) * 1000);
         if safe_until_ms <= now {
             return None;
         }
@@ -729,6 +773,16 @@ impl HaController {
         let pinned = self.read_document().await?;
         let document = pinned.document;
         let now = now_ms();
+
+        // During a live Reddit lease/claim, the Reddit owner is also the only
+        // HA-document writer allowed to drive the command poller. This avoids
+        // a second node renewing control state from a stale document and
+        // overwriting the Reddit lease.
+        if (document.owner_is_live(now) || document.claim_is_live(now))
+            && !self.owned_by_this_process(&document)
+        {
+            return Ok(());
+        }
 
         if document.control_owner_is_live(now) {
             if !self.control_owned_by_this_process(&document) {
@@ -832,7 +886,15 @@ impl HaController {
     }
 
     async fn commit_control_update_offset(&self, offset: i64) -> Result<()> {
+        let instance_id = self.cfg.instance_id.clone();
+        let nonce = self.nonce.to_string();
         self.update_document(|document| {
+            if document.control_owner.as_deref() != Some(instance_id.as_str())
+                || document.control_owner_nonce.as_deref() != Some(nonce.as_str())
+                || !document.control_owner_is_live(now_ms())
+            {
+                return Ok(());
+            }
             document.control_update_offset = document.control_update_offset.max(offset);
             Ok(())
         })
@@ -845,7 +907,15 @@ impl HaController {
     }
 
     pub async fn commit_data_update_offset(&self, offset: i64) -> Result<()> {
+        let instance_id = self.cfg.instance_id.clone();
+        let nonce = self.nonce.to_string();
         self.update_document(|document| {
+            if document.owner.as_deref() != Some(instance_id.as_str())
+                || document.owner_nonce.as_deref() != Some(nonce.as_str())
+                || !document.owner_is_live(now_ms())
+            {
+                return Ok(());
+            }
             document.data_update_offset = document.data_update_offset.max(offset);
             Ok(())
         })
@@ -975,15 +1045,15 @@ impl HaController {
             .update_document(|document| {
                 let now = now_ms();
                 if document.owner_is_live(now) {
-                    bail!("HA lease became live while claiming");
+                    return Ok(());
                 }
                 if document.claim_is_live(now)
                     && !claim_preemption_allowed(&self.cfg, document, &instance_id, now)
                 {
-                    bail!("another HA claim has priority");
+                    return Ok(());
                 }
                 let Some(rank) = claim_rank(&self.cfg, document, now, &instance_id) else {
-                    bail!("local instance is no longer an eligible HA candidate");
+                    return Ok(());
                 };
                 let base_ms = document.lease_expires_at_ms.max(document.written_at_ms);
                 let delay_ms = if document.handover_to.as_deref() == Some(instance_id.as_str()) {
@@ -994,7 +1064,7 @@ impl HaController {
                         .saturating_mul(1000)
                 };
                 if now < base_ms.saturating_add(delay_ms) {
-                    bail!("HA claim priority delay has not elapsed");
+                    return Ok(());
                 }
 
                 if document.phase != ControlPhase::Claim {
@@ -1009,6 +1079,9 @@ impl HaController {
                 document.lease_expires_at_ms = now.saturating_add(ttl_ms);
                 document.failover_allowed =
                     member(&self.cfg, &instance_id).is_some_and(|member| member.allow_fallback);
+                document.control_owner = Some(instance_id.clone());
+                document.control_owner_nonce = Some(nonce.clone());
+                document.control_lease_expires_at_ms = document.lease_expires_at_ms;
                 Ok(())
             })
             .await?;
@@ -1193,6 +1266,9 @@ impl HaController {
                 document.phase = ControlPhase::Lease;
                 document.lease_expires_at_ms = now.saturating_add(ttl_ms);
                 document.failover_allowed = allow_fallback;
+                document.control_owner = Some(instance_id.clone());
+                document.control_owner_nonce = Some(nonce.clone());
+                document.control_lease_expires_at_ms = document.lease_expires_at_ms;
                 document.claim_started_at_ms = 0;
                 document.previous_owner = None;
                 document.previous_owner_priority = None;
@@ -1237,6 +1313,9 @@ impl HaController {
             document.claim_started_at_ms = 0;
             document.lease_expires_at_ms = now.saturating_add(ttl_ms);
             document.failover_allowed = configured.allow_fallback;
+            document.control_owner = Some(instance_id.clone());
+            document.control_owner_nonce = Some(nonce.clone());
+            document.control_lease_expires_at_ms = document.lease_expires_at_ms;
             document.handover_to = None;
             Ok(())
         })
@@ -1324,6 +1403,13 @@ impl HaController {
             document.lease_expires_at_ms = now;
             document.owner_nonce = None;
             document.claim_started_at_ms = 0;
+            if document.control_owner.as_deref() == Some(instance_id.as_str())
+                && document.control_owner_nonce.as_deref() == Some(nonce.as_str())
+            {
+                document.control_owner = None;
+                document.control_owner_nonce = None;
+                document.control_lease_expires_at_ms = now;
+            }
 
             if document
                 .handover_to
@@ -1386,9 +1472,17 @@ impl HaController {
                 let mode = document.mode(&instance_id);
                 let allow_fallback =
                     mode != InstanceMode::Disconnected && configured.allow_fallback;
-                document.lease_expires_at_ms = now_ms();
+                let now = now_ms();
+                document.lease_expires_at_ms = now;
                 document.owner_nonce = None;
                 document.claim_started_at_ms = 0;
+                if document.control_owner.as_deref() == Some(instance_id.as_str())
+                    && document.control_owner_nonce.as_deref() == Some(nonce.as_str())
+                {
+                    document.control_owner = None;
+                    document.control_owner_nonce = None;
+                    document.control_lease_expires_at_ms = now;
+                }
                 document.handover_to = None;
                 document.phase = if allow_fallback {
                     ControlPhase::Lease
@@ -1873,6 +1967,11 @@ impl HaController {
     where
         F: FnMut(&mut HaDocument) -> Result<()>,
     {
+        // All clones of one HaController share this mutex. Without it the
+        // local lease-renewal task and data/control offset writers can race
+        // each other through Telegram's non-CAS editMessageText API.
+        let _write_guard = self.document_write_lock.lock().await;
+
         for attempt in 0..CONTROL_WRITE_RETRIES {
             let pinned = self.read_document().await?;
             let mut next = pinned.document.clone();
@@ -1955,6 +2054,18 @@ pub fn validate_config(cfg: &HaConfig) -> Result<()> {
     {
         bail!("ha.renew_interval_secs + ha.fail_closed_margin_secs must be lower than ha.lease_ttl_secs");
     }
+    if !cfg.replicate_state {
+        bail!("ha.replicate_state must be true for HA protocol 3");
+    }
+    if !(250..=60_000).contains(&cfg.replication_batch_ms) {
+        bail!("ha.replication_batch_ms must be in 250..60000");
+    }
+    if !(10..=10_000).contains(&cfg.replication_snapshot_every) {
+        bail!("ha.replication_snapshot_every must be in 10..10000");
+    }
+    if !(1..=16).contains(&cfg.replication_snapshot_chunk_mib) {
+        bail!("ha.replication_snapshot_chunk_mib must be in 1..16");
+    }
     if cfg.instances.is_empty() {
         bail!("ha.instances must contain at least one instance when HA is enabled");
     }
@@ -2016,12 +2127,16 @@ pub fn members_by_priority(cfg: &HaConfig) -> Vec<&HaInstanceConfig> {
 
 pub fn members_fingerprint(cfg: &HaConfig) -> String {
     let mut bytes = format!(
-        "thread={};ttl={};renew={};settle={};margin={};",
+        "thread={};ttl={};renew={};settle={};margin={};replicate={};batch={};snapshot={};chunk={};",
         cfg.control_thread_id,
         cfg.lease_ttl_secs,
         cfg.renew_interval_secs,
         cfg.claim_settle_secs,
-        cfg.fail_closed_margin_secs
+        cfg.fail_closed_margin_secs,
+        cfg.replicate_state,
+        cfg.replication_batch_ms,
+        cfg.replication_snapshot_every,
+        cfg.replication_snapshot_chunk_mib
     )
     .into_bytes();
     for configured in members_by_priority(cfg) {
@@ -2339,6 +2454,10 @@ mod tests {
             renew_interval_secs: 10,
             claim_settle_secs: 5,
             fail_closed_margin_secs: 5,
+            replicate_state: true,
+            replication_batch_ms: 2_000,
+            replication_snapshot_every: 100,
+            replication_snapshot_chunk_mib: 8,
             instances: vec![
                 HaInstanceConfig {
                     id: "ostrava".to_owned(),
@@ -2383,6 +2502,14 @@ mod tests {
         let mut second = cfg();
         second.instances.reverse();
         assert_eq!(members_fingerprint(&first), members_fingerprint(&second));
+    }
+
+    #[test]
+    fn replication_settings_are_part_of_cluster_fingerprint() {
+        let first = cfg();
+        let mut second = cfg();
+        second.replication_batch_ms += 1;
+        assert_ne!(members_fingerprint(&first), members_fingerprint(&second));
     }
 
     #[test]

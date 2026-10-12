@@ -83,6 +83,14 @@ pub struct HaConfig {
     pub claim_settle_secs: u64,
     #[serde(default = "default_ha_fail_closed_margin_secs")]
     pub fail_closed_margin_secs: u64,
+    #[serde(default = "default_true")]
+    pub replicate_state: bool,
+    #[serde(default = "default_ha_replication_batch_ms")]
+    pub replication_batch_ms: u64,
+    #[serde(default = "default_ha_replication_snapshot_every")]
+    pub replication_snapshot_every: u64,
+    #[serde(default = "default_ha_replication_snapshot_chunk_mib")]
+    pub replication_snapshot_chunk_mib: u64,
     #[serde(default)]
     pub instances: Vec<HaInstanceConfig>,
 }
@@ -99,6 +107,10 @@ impl Default for HaConfig {
             renew_interval_secs: default_ha_renew_interval_secs(),
             claim_settle_secs: default_ha_claim_settle_secs(),
             fail_closed_margin_secs: default_ha_fail_closed_margin_secs(),
+            replicate_state: true,
+            replication_batch_ms: default_ha_replication_batch_ms(),
+            replication_snapshot_every: default_ha_replication_snapshot_every(),
+            replication_snapshot_chunk_mib: default_ha_replication_snapshot_chunk_mib(),
             instances: Vec::new(),
         }
     }
@@ -144,6 +156,15 @@ const fn default_ha_claim_settle_secs() -> u64 {
 }
 const fn default_ha_fail_closed_margin_secs() -> u64 {
     5
+}
+const fn default_ha_replication_batch_ms() -> u64 {
+    2_000
+}
+const fn default_ha_replication_snapshot_every() -> u64 {
+    100
+}
+const fn default_ha_replication_snapshot_chunk_mib() -> u64 {
+    8
 }
 const fn default_true() -> bool {
     true

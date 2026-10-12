@@ -2132,10 +2132,15 @@ impl Bridge {
                 .unwrap_or(0)
         };
 
-        let updates = self
-            .telegram
-            .get_updates(offset, self.cfg.bridge.telegram_timeout_secs)
-            .await?;
+        let poll_timeout_secs = if self.ha.is_some() {
+            self.cfg
+                .bridge
+                .telegram_timeout_secs
+                .min(self.cfg.ha.renew_interval_secs.saturating_sub(1).max(1))
+        } else {
+            self.cfg.bridge.telegram_timeout_secs
+        };
+        let updates = self.telegram.get_updates(offset, poll_timeout_secs).await?;
         let mut next_offset = offset;
 
         for update in updates {
