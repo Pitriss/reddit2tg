@@ -1,0 +1,236 @@
+name: Promote release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag, for example v0.4.0-alpha2'
+        required: true
+        type: string
+      source_run_id:
+        description: 'Successful Build and bundle workflow run ID to promote'
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: promote-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Validate source workflow run
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RELEASE_TAG" in
+            v[0-9]*) ;;
+            *)
+              echo "Release tag must start with v followed by a digit: $RELEASE_TAG" >&2
+              exit 1
+              ;;
+          esac
+          case "$SOURCE_RUN_ID" in
+            ''|*[!0-9]*)
+              echo "source_run_id must be numeric" >&2
+              exit 1
+              ;;
+          esac
+
+          run_json="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID")"
+          run_path="$(printf '%s' "$run_json" | jq -r '.path')"
+          run_status="$(printf '%s' "$run_json" | jq -r '.status')"
+          run_conclusion="$(printf '%s' "$run_json" | jq -r '.conclusion')"
+          run_event="$(printf '%s' "$run_json" | jq -r '.event')"
+          source_sha="$(printf '%s' "$run_json" | jq -r '.head_sha')"
+          source_repo="$(printf '%s' "$run_json" | jq -r '.repository.full_name')"
+
+          test "$source_repo" = "$GITHUB_REPOSITORY" || {
+            echo "Source run belongs to $source_repo, expected $GITHUB_REPOSITORY" >&2
+            exit 1
+          }
+          test "$run_path" = ".github/workflows/build-release.yml" || {
+            echo "Source run uses $run_path, expected .github/workflows/build-release.yml" >&2
+            exit 1
+          }
+          case "$run_event" in
+            push|workflow_dispatch) ;;
+            *)
+              echo "Source run event $run_event is not promotable; pull-request builds cannot be released." >&2
+              exit 1
+              ;;
+          esac
+          test "$run_status" = "completed" || {
+            echo "Source run $SOURCE_RUN_ID is not completed: $run_status" >&2
+            exit 1
+          }
+          test "$run_conclusion" = "success" || {
+            echo "Source run $SOURCE_RUN_ID did not succeed: $run_conclusion" >&2
+            exit 1
+          }
+          test "${#source_sha}" -eq 40 || {
+            echo "Source run returned invalid SHA length: $source_sha" >&2
+            exit 1
+          }
+          case "$source_sha" in
+            *[!0-9a-f]*)
+              echo "Source run returned invalid head SHA: $source_sha" >&2
+              exit 1
+              ;;
+          esac
+
+          printf 'sha=%s\n' "$source_sha" >> "$GITHUB_OUTPUT"
+          printf 'artifact_name=reddit2tg-%s\n' "$source_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Check out exact source commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.source.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Verify tag matches source version
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          test -n "$cargo_version"
+          tag_version="${RELEASE_TAG#v}"
+          if [ "$cargo_version" != "$tag_version" ]; then
+            echo "Cargo.toml version $cargo_version does not match requested tag $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+      - name: Download exact CI bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.source.outputs.artifact_name }}
+          path: dist
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+
+      - name: Verify immutable release bundle
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+
+          cat > expected-assets.txt <<EOF
+          SHA256SUMS
+          reddit2tg-${version}-linux-aarch64-musl.tar.gz
+          reddit2tg-${version}-linux-arm64-stretch-musl.tar.gz
+          reddit2tg-${version}-linux-armhf-stretch-musl.tar.gz
+          reddit2tg-${version}-linux-armv7-musleabihf.tar.gz
+          reddit2tg-${version}-linux-x86_64-musl.tar.gz
+          reddit2tg_${version}_amd64.deb
+          reddit2tg_${version}_arm64-stretch.deb
+          reddit2tg_${version}_arm64.deb
+          reddit2tg_${version}_armhf-stretch.deb
+          reddit2tg_${version}_armhf.deb
+          EOF
+
+          find dist -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort > actual-assets.txt
+          LC_ALL=C sort -o expected-assets.txt expected-assets.txt
+          diff -u expected-assets.txt actual-assets.txt
+
+          test "$(wc -l < dist/SHA256SUMS)" -eq 10
+          (cd dist && sha256sum -c SHA256SUMS)
+
+          for deb in "dist/reddit2tg_${version}_arm64-stretch.deb" "dist/reddit2tg_${version}_armhf-stretch.deb"; do
+            members="$(ar t "$deb")"
+            printf '%s\n' "$members" | grep -qx 'control.tar.xz'
+            printf '%s\n' "$members" | grep -qx 'data.tar.xz'
+            if printf '%s\n' "$members" | grep -q '\.zst$'; then
+              echo "Stretch package unexpectedly contains zstd-compressed members: $deb" >&2
+              exit 1
+            fi
+          done
+
+      - name: Create or verify exact tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            git fetch --force origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+            existing_sha="$(git rev-list -n 1 "$RELEASE_TAG")"
+            if [ "$existing_sha" != "$SOURCE_SHA" ]; then
+              echo "Tag $RELEASE_TAG already points to $existing_sha, expected $SOURCE_SHA" >&2
+              exit 1
+            fi
+            echo "Tag $RELEASE_TAG already exists at the exact source commit."
+          else
+            git config user.name github-actions
+            git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+            git tag -a "$RELEASE_TAG" "$SOURCE_SHA" -m "reddit2tg $RELEASE_TAG"
+            git push origin "refs/tags/$RELEASE_TAG"
+          fi
+
+      - name: Inspect existing Release
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            rm -rf published-existing
+            mkdir published-existing
+            gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir published-existing
+            find published-existing -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort > existing-assets.txt
+            diff -u expected-assets.txt existing-assets.txt
+            cmp dist/SHA256SUMS published-existing/SHA256SUMS
+            (cd published-existing && sha256sum -c SHA256SUMS)
+            printf 'exists=true\n' >> "$GITHUB_OUTPUT"
+            echo "Release $RELEASE_TAG already contains the exact immutable bundle; nothing will be overwritten."
+          else
+            printf 'exists=false\n' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish immutable GitHub Release
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          prerelease=()
+          case "$version" in
+            *-*) prerelease=(--prerelease) ;;
+          esac
+          gh release create "$RELEASE_TAG" dist/*.tar.gz dist/*.deb dist/SHA256SUMS --verify-tag --generate-notes --title "reddit2tg $RELEASE_TAG" "${prerelease[@]}" --repo "$GITHUB_REPOSITORY"
+
+      - name: Verify published asset set
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf published-verify
+          mkdir published-verify
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir published-verify
+          find published-verify -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort > published-assets.txt
+          diff -u expected-assets.txt published-assets.txt
+          cmp dist/SHA256SUMS published-verify/SHA256SUMS
+          (cd published-verify && sha256sum -c SHA256SUMS)
