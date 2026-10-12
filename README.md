@@ -36,6 +36,32 @@ The target deployment is Linux/Devuan without Rust, Cargo, a system OpenSSL inst
 
 The default history limit is 50 replayable text/notice/image events and the accepted maximum is 2000. `dry-run` reports what would be processed without changing Telegram topics or SQLite mappings.
 
+### Multi-instance HA
+
+Optional HA mode allows multiple reddit2tg instances to stay online while only one instance owns the Reddit/Matrix session at a time.
+
+- every instance has a unique `ha.instance_id` and configured priority; lower numeric priority wins
+- all nodes share a dedicated HA control bot and a dedicated Telegram control group/supergroup
+- the HA control bot does not use `getUpdates`; nodes coordinate through the latest pinned control document
+- the normal `telegram.bot_token` remains the data-plane bot for that instance
+- the pinned document contains a lease plus a process-incarnation nonce
+- claims use a deterministic priority delay plus a settle window
+- Reddit authentication starts only after a claim survives the settle window
+- active Reddit work is lease-bounded and fails closed before lease expiry
+- `auto_failback = true` can request coordinated handover back to a better-priority node
+- maintenance mode keeps HA control commands alive while disabling Reddit communication
+
+General commands:
+
+- `/list-instances`
+- `/reddit-status`
+- `/reddit-connect <instance-id> [force]`
+- `/reddit-disconnect <instance-id>`
+- `/reddit-switch <instance-id>`
+- `/maintenance <instance-id> [on|off]`
+
+`/reddit-disconnect` is an administrative stop and does not itself trigger automatic handover. The HA control chat should be dedicated to reddit2tg and the control bot must be allowed to pin messages.
+
 ### Authentication and recovery
 
 - no Reddit password is required on the bridge host

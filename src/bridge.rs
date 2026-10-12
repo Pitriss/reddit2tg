@@ -15,6 +15,7 @@ use tracing::{error, info, warn};
 use crate::{
     config::Config,
     db::{Db, MessageSnapshot, RoomMap, TelegramDelivery},
+    ha::{parse_command as parse_ha_command, HaController},
     reddit::{
         detect_supported_image_mime, is_auth_refresh_error, matrix_localpart, member_display_name,
         reddit_upload_limit, InvitedRoom, JoinedRoom, MatrixEvent, RedditClient, SendImageRequest,
@@ -31,6 +32,7 @@ pub struct Bridge {
     db: Db,
     reddit: RedditClient,
     telegram: TelegramClient,
+    ha: Option<HaController>,
     startup_ms: i64,
 }
 
@@ -93,18 +95,34 @@ struct ProfileVisual {
 }
 
 impl Bridge {
-    pub fn new(cfg: Config, db: Db, reddit: RedditClient, telegram: TelegramClient) -> Self {
+    pub fn new(
+        cfg: Config,
+        db: Db,
+        reddit: RedditClient,
+        telegram: TelegramClient,
+        ha: Option<HaController>,
+    ) -> Self {
         Self {
             cfg: Arc::new(cfg),
             db,
             reddit,
             telegram,
+            ha,
             startup_ms: unix_ms(),
         }
     }
 
     pub async fn check(&self) -> Result<()> {
         self.telegram.probe().await?;
+        if let Some(ha) = &self.ha {
+            ha.probe().await?;
+            info!(
+                instance_id = %self.cfg.ha.instance_id,
+                "HA configuration probe successful; Reddit authentication intentionally skipped until lease ownership"
+            );
+            return Ok(());
+        }
+
         let session = self.reddit.authenticate().await?;
         info!(
             user_id = %session.user_id,
@@ -116,6 +134,9 @@ impl Bridge {
 
     pub async fn probe_runtime_config(&self) -> Result<()> {
         self.telegram.probe().await?;
+        if let Some(ha) = &self.ha {
+            ha.probe().await?;
+        }
         Ok(())
     }
 
@@ -942,6 +963,14 @@ impl Bridge {
     }
 
     pub async fn run(self) -> Result<()> {
+        if self.ha.is_some() {
+            self.run_ha().await
+        } else {
+            self.run_single_instance().await
+        }
+    }
+
+    async fn run_single_instance(self) -> Result<()> {
         match self.reddit.authenticate().await {
             Ok(session) => {
                 info!(
@@ -991,11 +1020,99 @@ impl Bridge {
         }
     }
 
+    async fn run_ha(self) -> Result<()> {
+        let ha = self
+            .ha
+            .clone()
+            .context("HA runtime requested without HA controller")?;
+
+        let matrix = self.clone();
+        let telegram = self.clone();
+        let control = self.clone();
+        let mut matrix_task = tokio::spawn(async move { matrix.matrix_loop().await });
+        let mut telegram_task = tokio::spawn(async move { telegram.telegram_loop().await });
+        let mut ha_task = tokio::spawn(async move { control.ha_loop().await });
+
+        tokio::select! {
+            result = &mut matrix_task => {
+                telegram_task.abort();
+                ha_task.abort();
+                let _ = telegram_task.await;
+                let _ = ha_task.await;
+                match result {
+                    Ok(result) => result.context("Matrix worker requested runtime recovery"),
+                    Err(error) => Err(anyhow!("Matrix worker task failed: {error}")),
+                }
+            }
+            result = &mut telegram_task => {
+                matrix_task.abort();
+                ha_task.abort();
+                let _ = matrix_task.await;
+                let _ = ha_task.await;
+                match result {
+                    Ok(result) => result.context("Telegram worker requested runtime recovery"),
+                    Err(error) => Err(anyhow!("Telegram worker task failed: {error}")),
+                }
+            }
+            result = &mut ha_task => {
+                matrix_task.abort();
+                telegram_task.abort();
+                let _ = matrix_task.await;
+                let _ = telegram_task.await;
+                match result {
+                    Ok(result) => result.context("HA control worker stopped"),
+                    Err(error) => Err(anyhow!("HA control worker task failed: {error}")),
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                ha_task.abort();
+                matrix_task.abort();
+                telegram_task.abort();
+                let _ = ha_task.await;
+                let _ = matrix_task.await;
+                let _ = telegram_task.await;
+                ha.shutdown(&self.reddit).await;
+                info!("shutdown requested");
+                Ok(())
+            }
+        }
+    }
+
+    async fn ha_loop(&self) -> Result<()> {
+        let ha = self
+            .ha
+            .as_ref()
+            .context("HA loop requested without HA controller")?;
+        ha.run(self.reddit.clone()).await
+    }
+
     async fn matrix_loop(&self) -> Result<()> {
         let mut backoff = 1u64;
         let mut consecutive_client_failures = 0u32;
         loop {
-            match self.matrix_iteration().await {
+            let iteration = if let Some(ha) = &self.ha {
+                let Some(permit) = ha.active_permit().await else {
+                    sleep(Duration::from_secs(1)).await;
+                    continue;
+                };
+                let safe_for = permit.safe_for();
+                let result = tokio::time::timeout(safe_for, self.matrix_iteration()).await;
+                drop(permit);
+                match result {
+                    Ok(result) => result,
+                    Err(_) => {
+                        info!(
+                            instance_id = %self.cfg.ha.instance_id,
+                            "Matrix iteration cancelled at HA lease safety cutoff"
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                self.matrix_iteration().await
+            };
+
+            match iteration {
                 Ok(()) => {
                     backoff = 1;
                     consecutive_client_failures = 0;
@@ -2177,6 +2294,124 @@ impl Bridge {
     }
 
     async fn process_telegram_message(&self, update_id: i64, message: &Message) -> Result<()> {
+        let general = message.message_thread_id.is_none() || message.message_thread_id == Some(1);
+
+        if let Some(text) = message.text.as_deref() {
+            if let Some(command) = parse_ha_command(text) {
+                if !general {
+                    if let Some(thread_id) = message.message_thread_id {
+                        self.telegram
+                            .send_text(thread_id, "HA příkazy lze spouštět pouze v General.")
+                            .await?;
+                    }
+                    return Ok(());
+                }
+
+                match command {
+                    Err(usage) => self.telegram.send_general(usage).await?,
+                    Ok(command) => {
+                        if let Some(ha) = &self.ha {
+                            let report = match ha.execute_command(command, update_id).await {
+                                Ok(report) => report,
+                                Err(error) => format!("HA příkaz selhal: {error:#}"),
+                            };
+                            self.telegram.send_general(&report).await?;
+                        } else {
+                            self.telegram
+                                .send_general("HA režim není v této instanci zapnutý.")
+                                .await?;
+                        }
+                    }
+                }
+                return Ok(());
+            }
+
+            if let Some(valid) = parse_help_command(text) {
+                if !valid {
+                    if general {
+                        self.telegram.send_general("Použití: /help").await?;
+                    } else if let Some(thread_id) = message.message_thread_id {
+                        self.telegram.send_text(thread_id, "Použití: /help").await?;
+                    }
+                    return Ok(());
+                }
+
+                if general {
+                    self.telegram
+                        .send_general(&general_help_text_with_ha(self.ha.is_some()))
+                        .await?;
+                } else if let Some(thread_id) = message.message_thread_id {
+                    let room = self.db.room_by_thread(thread_id)?;
+                    self.telegram
+                        .send_text(
+                            thread_id,
+                            topic_help_text(room.as_ref().map(|room| room.status.as_str())),
+                        )
+                        .await?;
+                }
+                return Ok(());
+            }
+        }
+
+        if message.text.is_none() && !message.has_attachment() {
+            return Ok(());
+        }
+
+        if let Some(ha) = &self.ha {
+            let Some(permit) = ha.active_permit().await else {
+                let report = ha.inactive_message().await;
+                if let Some(thread_id) = message.message_thread_id {
+                    self.telegram.send_text(thread_id, &report).await?;
+                } else if message
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| text.trim_start().starts_with('/'))
+                {
+                    self.telegram.send_general(&report).await?;
+                }
+                return Ok(());
+            };
+
+            let safe_for = permit.safe_for();
+            let result = tokio::time::timeout(
+                safe_for,
+                self.process_telegram_active_message(update_id, message),
+            )
+            .await;
+            drop(permit);
+
+            return match result {
+                Ok(result) => result,
+                Err(_) => {
+                    warn!(
+                        update_id,
+                        telegram_message_id = message.message_id,
+                        instance_id = %self.cfg.ha.instance_id,
+                        "Telegram operation cancelled at HA lease safety cutoff"
+                    );
+                    if let Some(thread_id) = message.message_thread_id {
+                        let _ = self
+                            .telegram
+                            .send_text(
+                                thread_id,
+                                "Operace byla přerušena kvůli HA lease safety cutoffu; ověř /reddit-status.",
+                            )
+                            .await;
+                    }
+                    Ok(())
+                }
+            };
+        }
+
+        self.process_telegram_active_message(update_id, message)
+            .await
+    }
+
+    async fn process_telegram_active_message(
+        &self,
+        update_id: i64,
+        message: &Message,
+    ) -> Result<()> {
         if message.text.is_none() && message.has_attachment() {
             return self
                 .process_telegram_media_message(update_id, message)
@@ -2607,6 +2842,17 @@ fn general_help_text() -> &'static str {
 /delete-archived — trvale smaže všechny bridge-em evidované archivované topicy\n\
 \n\
 Příkazy pro konkrétní Reddit chat jsou dostupné uvnitř jeho topicu."
+}
+
+fn general_help_text_with_ha(ha_enabled: bool) -> String {
+    if !ha_enabled {
+        return general_help_text().to_owned();
+    }
+
+    format!(
+        "{}\n\nHA cluster:\n/list-instances\n/reddit-status\n/reddit-connect <instance-id> [force]\n/reddit-disconnect <instance-id>\n/reddit-switch <instance-id>\n/maintenance <instance-id> [on|off]",
+        general_help_text()
+    )
 }
 
 fn topic_help_text(status: Option<&str>) -> &'static str {

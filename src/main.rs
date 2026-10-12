@@ -14,7 +14,8 @@ use tracing::error;
 use tracing_subscriber::EnvFilter;
 
 use crate::{
-    bridge::Bridge, config::Config, db::Db, reddit::RedditClient, telegram::TelegramClient,
+    bridge::Bridge, config::Config, db::Db, ha::HaController, reddit::RedditClient,
+    telegram::TelegramClient,
 };
 
 #[derive(Debug, Parser)]
@@ -42,19 +43,21 @@ enum Command {
 
 const RUNTIME_RECOVERY_DELAY_SECS: u64 = 5;
 
-fn build_bridge(cfg: &Config, db: &Db) -> Result<Bridge> {
+fn build_bridge(cfg: &Config, db: &Db, ha_process_nonce: Option<&str>) -> Result<Bridge> {
     let reddit = RedditClient::new(cfg, db.clone())?;
     let telegram = TelegramClient::new(
         &cfg.telegram.bot_token,
         cfg.telegram.chat_id,
         cfg.telegram.operator_user_id,
     )?;
-    Ok(Bridge::new(cfg.clone(), db.clone(), reddit, telegram))
+    let ha = HaController::new(&cfg.ha, ha_process_nonce)?;
+    Ok(Bridge::new(cfg.clone(), db.clone(), reddit, telegram, ha))
 }
 
 async fn run_supervised(cfg: &Config, db: &Db) -> Result<()> {
     let mut recovery_generation = 0u64;
-    let mut bridge = build_bridge(cfg, db)?;
+    let ha_process_nonce = HaController::process_nonce(&cfg.ha);
+    let mut bridge = build_bridge(cfg, db, ha_process_nonce.as_deref())?;
     bridge.probe_runtime_config().await?;
 
     loop {
@@ -69,7 +72,7 @@ async fn run_supervised(cfg: &Config, db: &Db) -> Result<()> {
                     "bridge runtime unhealthy; recreating Reddit and Telegram clients"
                 );
                 sleep(Duration::from_secs(RUNTIME_RECOVERY_DELAY_SECS)).await;
-                bridge = build_bridge(cfg, db)?;
+                bridge = build_bridge(cfg, db, ha_process_nonce.as_deref())?;
             }
         }
     }
@@ -91,9 +94,19 @@ async fn main() -> Result<()> {
 
     match cli.command.unwrap_or(Command::Run) {
         Command::Run => run_supervised(&cfg, &db).await,
-        Command::Check => build_bridge(&cfg, &db)?.check().await,
+        Command::Check => {
+            let nonce = HaController::process_nonce(&cfg.ha);
+            build_bridge(&cfg, &db, nonce.as_deref())?.check().await
+        }
         Command::ReconcileNames { dry_run } => {
-            let report = build_bridge(&cfg, &db)?.reconcile_names(dry_run).await?;
+            if cfg.ha.enabled {
+                anyhow::bail!(
+                    "CLI reconcile-names is disabled in HA mode; run /reconcile-names from Telegram on the active instance"
+                );
+            }
+            let report = build_bridge(&cfg, &db, None)?
+                .reconcile_names(dry_run)
+                .await?;
             println!("{report}");
             Ok(())
         }

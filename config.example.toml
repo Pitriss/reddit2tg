@@ -27,8 +27,8 @@ refresh_before_secs = 3600
 # Each node sets only ha.instance_id to its own member id.
 #
 # The control bot is separate from telegram.bot_token and is reserved for HA
-# lease/control state. Runtime integration will use a pinned control message as
-# the fencing token; Reddit authentication is allowed only to the lease owner.
+# lease/control state. A pinned control message is the fencing token; Reddit
+# authentication and bridging are allowed only to the current lease owner.
 [ha]
 enabled = false
 # cluster_id = "prod"

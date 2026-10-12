@@ -245,6 +245,11 @@ impl RedditClient {
         self.authenticate_locked().await
     }
 
+    pub async fn soft_disconnect(&self) -> Result<()> {
+        let _refresh_guard = self.refresh_lock.lock().await;
+        self.invalidate_session().await
+    }
+
     async fn authenticate_locked(&self) -> Result<MatrixSession> {
         if cookie_value(&self.cookie_header, "reddit_session").is_none() {
             return Err(auth_error(
