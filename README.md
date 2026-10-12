@@ -60,6 +60,8 @@ The default history limit is 50 replayable text/notice/image events and the acce
 - `reddit2tg check` validates Reddit/Matrix authentication and Telegram bot/forum configuration before the daemon is started
 - `reddit2tg reconcile-names [--dry-run]` is available from the CLI in addition to the Telegram command
 - release builds are static MUSL binaries for `x86_64`, `aarch64`, and ARMv7 hard-float (`armhf`)
+- releases also include explicit Debian 9 Stretch legacy ARM builds for `arm64` and `armhf`; these use conservative generic CPU code generation and are smoke-tested with QEMU before packaging
+- the legacy ARM builds remain statically linked with MUSL, so they do not depend on the target system's glibc; final validation on the actual legacy kernel/hardware is still recommended
 - release packaging includes `.tar.gz` archives, Debian packages, and SHA256 checksums
 - Devuan/SysV init is supported, with an optional systemd unit included in the package
 

@@ -5,6 +5,7 @@ BIN=${1:-target/x86_64-unknown-linux-musl/release/reddit2tg}
 DIST=${DIST:-dist}
 ARCH=${ARCH:-amd64}
 TARGET_NAME=${TARGET_NAME:-linux-x86_64-musl}
+DEB_FILE_SUFFIX=${DEB_FILE_SUFFIX:-}
 
 [ -f "$BIN" ] || { echo "binary not found: $BIN" >&2; exit 1; }
 command -v dpkg-deb >/dev/null 2>&1 || { echo "dpkg-deb not found" >&2; exit 1; }
@@ -208,7 +209,17 @@ exit 0
 EOF_POSTRM
 chmod 0755 "$DEB_ROOT/DEBIAN/postrm"
 
-DEB_FILE="$DIST/reddit2tg_${VERSION}_${ARCH}.deb"
+if [ -n "$DEB_FILE_SUFFIX" ]; then
+  case "$DEB_FILE_SUFFIX" in
+    *[!A-Za-z0-9.+~-]*)
+      echo "invalid DEB_FILE_SUFFIX: $DEB_FILE_SUFFIX" >&2
+      exit 1
+      ;;
+  esac
+  DEB_FILE="$DIST/reddit2tg_${VERSION}_${ARCH}-${DEB_FILE_SUFFIX}.deb"
+else
+  DEB_FILE="$DIST/reddit2tg_${VERSION}_${ARCH}.deb"
+fi
 dpkg-deb --root-owner-group --build "$DEB_ROOT" "$DEB_FILE" >/dev/null
 
 printf '%s\n' "$TAR_FILE"

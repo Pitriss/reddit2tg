@@ -47,12 +47,38 @@ jobs:
           - target: x86_64-unknown-linux-musl
             deb_arch: amd64
             target_name: linux-x86_64-musl
+            artifact_name: amd64
+            rustflags: ''
+            qemu: ''
+            deb_suffix: ''
           - target: aarch64-unknown-linux-musl
             deb_arch: arm64
             target_name: linux-aarch64-musl
+            artifact_name: arm64
+            rustflags: ''
+            qemu: ''
+            deb_suffix: ''
           - target: armv7-unknown-linux-musleabihf
             deb_arch: armhf
             target_name: linux-armv7-musleabihf
+            artifact_name: armhf
+            rustflags: ''
+            qemu: ''
+            deb_suffix: ''
+          - target: aarch64-unknown-linux-musl
+            deb_arch: arm64
+            target_name: linux-arm64-stretch-musl
+            artifact_name: arm64-stretch
+            rustflags: '-C target-cpu=generic'
+            qemu: qemu-aarch64-static
+            deb_suffix: stretch
+          - target: armv7-unknown-linux-musleabihf
+            deb_arch: armhf
+            target_name: linux-armhf-stretch-musl
+            artifact_name: armhf-stretch
+            rustflags: '-C target-cpu=generic'
+            qemu: qemu-arm-static
+            deb_suffix: stretch
 
     steps:
       - name: Check out repository
@@ -61,12 +87,18 @@ jobs:
       - name: Install packaging tools
         run: sudo apt-get update && sudo apt-get install -y binutils file dpkg-dev
 
+      - name: Install legacy QEMU
+        if: matrix.qemu != ''
+        run: sudo apt-get install -y qemu-user-static
+
       - name: Install cross
         uses: taiki-e/install-action@v2
         with:
           tool: cross
 
       - name: Build static MUSL release
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: cross build --release --locked --target '${{ matrix.target }}'
 
       - name: Verify static binary
@@ -81,16 +113,34 @@ jobs:
             exit 1
           fi
 
+      - name: Smoke-test legacy ARM binary with QEMU
+        if: matrix.qemu != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/reddit2tg"
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          "${{ matrix.qemu }}" "$bin" --version | grep -Fx "reddit2tg $version"
+
       - name: Build tar.gz and Debian package
         env:
           ARCH: ${{ matrix.deb_arch }}
           TARGET_NAME: ${{ matrix.target_name }}
+          DEB_FILE_SUFFIX: ${{ matrix.deb_suffix }}
         run: bash scripts/package-release.sh 'target/${{ matrix.target }}/release/reddit2tg'
+
+      - name: Verify Debian package architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          deb="$(find dist -maxdepth 1 -type f -name '*.deb' -print -quit)"
+          test -n "$deb"
+          test "$(dpkg-deb -f "$deb" Architecture)" = "${{ matrix.deb_arch }}"
 
       - name: Upload architecture artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: reddit2tg-build-${{ matrix.deb_arch }}-${{ github.sha }}
+          name: reddit2tg-build-${{ matrix.artifact_name }}-${{ github.sha }}
           path: |
             dist/*.tar.gz
             dist/*.deb
