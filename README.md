@@ -516,21 +516,19 @@ SHA256SUMS
 
 The ARMv7 target is hard-float and maps to Debian/Devuan `armhf`. It does not cover ARMv6-only boards. For current Raspberry Pi OS/Devuan 64-bit installations, prefer the `arm64` package.
 
-For a pushed version tag such as `v0.1.4`, GitHub creates or updates one matching Release only after all three architecture builds succeed, and attaches the complete multi-architecture set. The workflow deliberately rejects a tag whose version does not match the `version` field in `Cargo.toml`.
+Release publication is deliberately separated from compilation. `.github/workflows/build-release.yml` builds and tests branch commits and uploads one combined `reddit2tg-<commit-sha>` workflow artifact; pushing a `v*` tag does **not** start another build.
 
-A normal remote release is therefore:
+To publish a version, first push the version commit and wait for its **Build and bundle** workflow run to succeed. Then promote that exact successful run with `.github/workflows/promote-release.yml`, supplying the requested tag and the source workflow `run_id`. The promotion workflow verifies that the source run succeeded, checks out its exact commit SHA, verifies that `Cargo.toml` matches the requested tag, downloads the already-built combined bundle, validates the exact asset set and `SHA256SUMS`, checks the Stretch `.deb` compression, creates or verifies the tag at that exact SHA, and finally creates the GitHub Release.
 
-```sh
-git tag -a v0.1.4 -m 'reddit2tg v0.1.4'
-```
+For example:
 
 ```sh
-git push origin HEAD
+gh workflow run promote-release.yml -f tag=v0.4.0-alpha2 -f source_run_id=123456789
 ```
 
-```sh
-git push origin v0.1.4
-```
+Published releases are immutable through this workflow: it never uploads with `--clobber`. A rerun is idempotent: if the tag already points to the exact source commit and the existing Release contains the exact same asset set and checksums, promotion succeeds without replacing anything. A different tag target or different published bundle is rejected.
+
+GitHub requires a `workflow_dispatch` workflow to exist on the repository's default branch before it can be dispatched. Merge the promotion workflow to the default branch before using it to publish a feature-branch or prerelease build; the selected `source_run_id` still determines the exact commit and bundle being released.
 
 The `.deb` packages install the static binary as `/usr/bin/reddit2tg`, the SysV init script as `/etc/init.d/reddit2tg`, and an optional systemd unit as `/lib/systemd/system/reddit2tg.service`. They create the unprivileged `reddit2tg` account and `/var/lib/reddit2tg`, and create `/etc/reddit2tg/config.toml` from the example only when that file does not already exist.
 
