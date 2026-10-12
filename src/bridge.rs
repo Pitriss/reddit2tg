@@ -15,7 +15,7 @@ use tracing::{error, info, warn};
 use crate::{
     config::Config,
     db::{Db, MessageSnapshot, RoomMap, TelegramDelivery},
-    ha::{parse_command as parse_ha_command, HaController},
+    ha::{HaController, HA_CONTROL_TOPIC_NAME},
     reddit::{
         detect_supported_image_mime, is_auth_refresh_error, matrix_localpart, member_display_name,
         reddit_upload_limit, InvitedRoom, JoinedRoom, MatrixEvent, RedditClient, SendImageRequest,
@@ -2056,7 +2056,29 @@ impl Bridge {
         let mut backoff = 1u64;
         let mut consecutive_client_failures = 0u32;
         loop {
-            match self.telegram_iteration().await {
+            let iteration = if let Some(ha) = &self.ha {
+                let Some(permit) = ha.active_permit().await else {
+                    sleep(Duration::from_secs(1)).await;
+                    continue;
+                };
+                let safe_for = permit.safe_for();
+                let result = tokio::time::timeout(safe_for, self.telegram_iteration()).await;
+                drop(permit);
+                match result {
+                    Ok(result) => result,
+                    Err(_) => {
+                        info!(
+                            instance_id = %self.cfg.ha.instance_id,
+                            "Telegram data-bot polling cancelled at HA lease safety cutoff"
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                self.telegram_iteration().await
+            };
+
+            match iteration {
                 Ok(()) => {
                     backoff = 1;
                     consecutive_client_failures = 0;
@@ -2101,20 +2123,37 @@ impl Bridge {
     }
 
     async fn telegram_iteration(&self) -> Result<()> {
-        let offset = self
-            .db
-            .get_meta("telegram_offset")?
-            .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(0);
+        let offset = if let Some(ha) = &self.ha {
+            ha.data_update_offset().await?
+        } else {
+            self.db
+                .get_meta("telegram_offset")?
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(0)
+        };
+
         let updates = self
             .telegram
             .get_updates(offset, self.cfg.bridge.telegram_timeout_secs)
             .await?;
         let mut next_offset = offset;
+
         for update in updates {
             next_offset = next_offset.max(update.update_id + 1);
             if let Some(message) = update.message.as_ref() {
-                if self.telegram.accepts(message) {
+                let reserved_control_thread = self
+                    .ha
+                    .as_ref()
+                    .is_some_and(|ha| ha.is_control_thread(message.message_thread_id));
+
+                if reserved_control_thread {
+                    info!(
+                        update_id = update.update_id,
+                        message_id = message.message_id,
+                        telegram_thread_id = ?message.message_thread_id,
+                        "Telegram data bot ignored reserved HA control topic"
+                    );
+                } else if self.telegram.accepts(message) {
                     info!(
                         update_id = update.update_id,
                         message_id = message.message_id,
@@ -2127,9 +2166,15 @@ impl Bridge {
                         .with_context(|| format!("Telegram update {}", update.update_id))?;
                 }
             }
-            self.db
-                .set_meta("telegram_offset", &next_offset.to_string())?;
+
+            if let Some(ha) = &self.ha {
+                ha.commit_data_update_offset(next_offset).await?;
+            } else {
+                self.db
+                    .set_meta("telegram_offset", &next_offset.to_string())?;
+            }
         }
+
         Ok(())
     }
 
@@ -2294,115 +2339,6 @@ impl Bridge {
     }
 
     async fn process_telegram_message(&self, update_id: i64, message: &Message) -> Result<()> {
-        let general = message.message_thread_id.is_none() || message.message_thread_id == Some(1);
-
-        if let Some(text) = message.text.as_deref() {
-            if let Some(command) = parse_ha_command(text) {
-                if !general {
-                    if let Some(thread_id) = message.message_thread_id {
-                        self.telegram
-                            .send_text(thread_id, "HA příkazy lze spouštět pouze v General.")
-                            .await?;
-                    }
-                    return Ok(());
-                }
-
-                match command {
-                    Err(usage) => self.telegram.send_general(usage).await?,
-                    Ok(command) => {
-                        if let Some(ha) = &self.ha {
-                            let report = match ha.execute_command(command, update_id).await {
-                                Ok(report) => report,
-                                Err(error) => format!("HA příkaz selhal: {error:#}"),
-                            };
-                            self.telegram.send_general(&report).await?;
-                        } else {
-                            self.telegram
-                                .send_general("HA režim není v této instanci zapnutý.")
-                                .await?;
-                        }
-                    }
-                }
-                return Ok(());
-            }
-
-            if let Some(valid) = parse_help_command(text) {
-                if !valid {
-                    if general {
-                        self.telegram.send_general("Použití: /help").await?;
-                    } else if let Some(thread_id) = message.message_thread_id {
-                        self.telegram.send_text(thread_id, "Použití: /help").await?;
-                    }
-                    return Ok(());
-                }
-
-                if general {
-                    self.telegram
-                        .send_general(&general_help_text_with_ha(self.ha.is_some()))
-                        .await?;
-                } else if let Some(thread_id) = message.message_thread_id {
-                    let room = self.db.room_by_thread(thread_id)?;
-                    self.telegram
-                        .send_text(
-                            thread_id,
-                            topic_help_text(room.as_ref().map(|room| room.status.as_str())),
-                        )
-                        .await?;
-                }
-                return Ok(());
-            }
-        }
-
-        if message.text.is_none() && !message.has_attachment() {
-            return Ok(());
-        }
-
-        if let Some(ha) = &self.ha {
-            let Some(permit) = ha.active_permit().await else {
-                let report = ha.inactive_message().await;
-                if let Some(thread_id) = message.message_thread_id {
-                    self.telegram.send_text(thread_id, &report).await?;
-                } else if message
-                    .text
-                    .as_deref()
-                    .is_some_and(|text| text.trim_start().starts_with('/'))
-                {
-                    self.telegram.send_general(&report).await?;
-                }
-                return Ok(());
-            };
-
-            let safe_for = permit.safe_for();
-            let result = tokio::time::timeout(
-                safe_for,
-                self.process_telegram_active_message(update_id, message),
-            )
-            .await;
-            drop(permit);
-
-            return match result {
-                Ok(result) => result,
-                Err(_) => {
-                    warn!(
-                        update_id,
-                        telegram_message_id = message.message_id,
-                        instance_id = %self.cfg.ha.instance_id,
-                        "Telegram operation cancelled at HA lease safety cutoff"
-                    );
-                    if let Some(thread_id) = message.message_thread_id {
-                        let _ = self
-                            .telegram
-                            .send_text(
-                                thread_id,
-                                "Operace byla přerušena kvůli HA lease safety cutoffu; ověř /reddit-status.",
-                            )
-                            .await;
-                    }
-                    Ok(())
-                }
-            };
-        }
-
         self.process_telegram_active_message(update_id, message)
             .await
     }
@@ -2844,17 +2780,6 @@ fn general_help_text() -> &'static str {
 Příkazy pro konkrétní Reddit chat jsou dostupné uvnitř jeho topicu."
 }
 
-fn general_help_text_with_ha(ha_enabled: bool) -> String {
-    if !ha_enabled {
-        return general_help_text().to_owned();
-    }
-
-    format!(
-        "{}\n\nHA cluster:\n/list-instances\n/reddit-status\n/reddit-connect <instance-id> [force]\n/reddit-disconnect <instance-id>\n/reddit-switch <instance-id>\n/maintenance <instance-id> [on|off]",
-        general_help_text()
-    )
-}
-
 fn topic_help_text(status: Option<&str>) -> &'static str {
     match status {
         Some("invite") => {
@@ -3160,7 +3085,12 @@ fn human_bytes(bytes: u64) -> String {
 fn clean_name(value: &str) -> String {
     let v = value.trim();
     let base = if v.is_empty() { "Reddit chat" } else { v };
-    base.chars().take(110).collect()
+    let cleaned: String = base.chars().take(110).collect();
+    if cleaned.eq_ignore_ascii_case(HA_CONTROL_TOPIC_NAME) {
+        format!("Reddit · {cleaned}")
+    } else {
+        cleaned
+    }
 }
 
 fn matrix_reply_target(content: &Value) -> Option<String> {
@@ -3204,8 +3134,8 @@ fn unix_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        fallback_topic_color, general_help_text, history_timestamp, matrix_reply_target,
-        parse_allow_delete_command, parse_help_command, parse_history_command,
+        clean_name, fallback_topic_color, general_help_text, history_timestamp,
+        matrix_reply_target, parse_allow_delete_command, parse_help_command, parse_history_command,
         parse_reconcile_names_command, profile_intro_text, runtime_client_recovery_error,
         runtime_recovery_required, startup_event_should_forward, topic_color_from_avatar,
         topic_help_text, AllowDeleteCommand, HistoryCommand, HistoryCommandKind,
@@ -3324,6 +3254,13 @@ mod tests {
     fn profile_intro_uses_normalized_reddit_username() {
         assert_eq!(profile_intro_text("u/example"), "Reddit · u/example");
         assert_eq!(profile_intro_text("example"), "Reddit · u/example");
+    }
+
+    #[test]
+    fn reserved_ha_control_topic_name_is_not_used_for_reddit_chat() {
+        assert_eq!(clean_name("ha-control-room"), "Reddit · ha-control-room");
+        assert_eq!(clean_name("HA-CONTROL-ROOM"), "Reddit · HA-CONTROL-ROOM");
+        assert_eq!(clean_name("normal-user"), "normal-user");
     }
 
     #[test]

@@ -20,9 +20,11 @@ use crate::{
     reddit::RedditClient,
 };
 
-pub const HA_PROTOCOL_VERSION: u32 = 1;
-pub const HA_CONTROL_PREFIX: &str = "reddit2tg-ha-v1\n";
+pub const HA_PROTOCOL_VERSION: u32 = 2;
+pub const HA_CONTROL_PREFIX: &str = "reddit2tg-ha-v2\n";
+pub const HA_CONTROL_TOPIC_NAME: &str = "ha-control-room";
 const CONTROL_POLL_SECS: u64 = 2;
+const CONTROL_CLAIM_STAGGER_MS: i64 = 1_000;
 const CONTROL_WRITE_RETRIES: usize = 8;
 const MAX_CONTROL_RATE_LIMIT_RETRIES: usize = 5;
 
@@ -111,6 +113,16 @@ pub struct HaDocument {
     #[serde(default)]
     pub modes: BTreeMap<String, InstanceMode>,
     pub request: Option<HaRequest>,
+    #[serde(default)]
+    pub control_owner: Option<String>,
+    #[serde(default)]
+    pub control_owner_nonce: Option<String>,
+    #[serde(default)]
+    pub control_lease_expires_at_ms: i64,
+    #[serde(default)]
+    pub control_update_offset: i64,
+    #[serde(default)]
+    pub data_update_offset: i64,
 }
 
 impl HaDocument {
@@ -138,6 +150,11 @@ impl HaDocument {
             handover_to: None,
             modes,
             request: None,
+            control_owner: None,
+            control_owner_nonce: None,
+            control_lease_expires_at_ms: now_ms,
+            control_update_offset: 0,
+            data_update_offset: 0,
         }
     }
 
@@ -158,6 +175,10 @@ impl HaDocument {
         self.phase == ControlPhase::Claim
             && self.owner.is_some()
             && self.lease_expires_at_ms > now_ms
+    }
+
+    pub fn control_owner_is_live(&self, now_ms: i64) -> bool {
+        self.control_owner.is_some() && self.control_lease_expires_at_ms > now_ms
     }
 }
 
@@ -214,6 +235,7 @@ pub struct HaController {
     role: Arc<RwLock<LocalRole>>,
     lease_expires_at_ms: Arc<Mutex<i64>>,
     claim_cooldown_until_ms: Arc<Mutex<i64>>,
+    state_message_id: Arc<Mutex<Option<i64>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -227,6 +249,8 @@ struct HaTelegramClient {
     http: Client,
     base: String,
     chat_id: i64,
+    thread_id: i64,
+    operator_user_id: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -242,13 +266,48 @@ struct ResponseParameters {
     retry_after: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct HaUpdate {
+    update_id: i64,
+    message: Option<HaIncomingMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HaIncomingMessage {
+    message_thread_id: Option<i64>,
+    chat: HaIncomingChat,
+    from: Option<HaIncomingUser>,
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HaIncomingChat {
+    id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct HaIncomingUser {
+    id: i64,
+    #[serde(default)]
+    is_bot: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct HaGetUpdatesBody {
+    offset: i64,
+    timeout: u64,
+    allowed_updates: [&'static str; 1],
+}
+
 impl HaTelegramClient {
-    fn new(bot_token: &str, chat_id: i64) -> Result<Self> {
+    fn new(bot_token: &str, chat_id: i64, thread_id: i64, operator_user_id: i64) -> Result<Self> {
         let http = Client::builder().timeout(Duration::from_secs(30)).build()?;
         Ok(Self {
             http,
             base: format!("https://api.telegram.org/bot{}", bot_token.trim()),
             chat_id,
+            thread_id,
+            operator_user_id,
         })
     }
 
@@ -259,12 +318,25 @@ impl HaTelegramClient {
             .and_then(Value::as_i64)
             .context("HA control bot getMe response has no numeric bot id")?;
 
+        let webhook: Value = self.call("getWebhookInfo", &serde_json::json!({})).await?;
+        if webhook
+            .get("url")
+            .and_then(Value::as_str)
+            .is_some_and(|url| !url.is_empty())
+        {
+            bail!("HA control bot currently has a webhook configured; remove it before HA getUpdates polling");
+        }
+
         let chat: Value = self
             .call("getChat", &serde_json::json!({"chat_id": self.chat_id}))
             .await?;
-        let chat_type = chat.get("type").and_then(Value::as_str).unwrap_or("");
-        if chat_type != "group" && chat_type != "supergroup" {
-            bail!("ha.control_chat_id must point to a Telegram group or supergroup");
+        if chat.get("type").and_then(Value::as_str) != Some("supergroup") {
+            bail!("HA control bot must use the same Telegram supergroup as telegram.chat_id");
+        }
+        if chat.get("is_forum").and_then(Value::as_bool) != Some(true) {
+            bail!(
+                "HA control bot requires the configured Telegram supergroup to have Topics enabled"
+            );
         }
 
         let member: Value = self
@@ -294,6 +366,15 @@ impl HaTelegramClient {
         let Some(message) = chat.get("pinned_message") else {
             return Ok(None);
         };
+
+        let thread_id = message.get("message_thread_id").and_then(Value::as_i64);
+        if thread_id != Some(self.thread_id) {
+            bail!(
+                "latest pinned Telegram message is outside configured HA thread {}; HA fails closed until the HA state message is the latest pin",
+                self.thread_id
+            );
+        }
+
         let message_id = message
             .get("message_id")
             .and_then(Value::as_i64)
@@ -301,9 +382,12 @@ impl HaTelegramClient {
         let text = message
             .get("text")
             .and_then(Value::as_str)
-            .context("latest pinned HA control message is not a text message")?;
+            .context("HA pinned control message is not a text message")?;
         let Some(decoded) = decode_document(text) else {
-            bail!("latest pinned message in HA control chat is not a reddit2tg HA document; use a dedicated control chat");
+            bail!(
+                "latest pinned message in configured HA thread {} is not a reddit2tg HA document",
+                self.thread_id
+            );
         };
         Ok(Some(PinnedDocument {
             message_id,
@@ -318,6 +402,7 @@ impl HaTelegramClient {
                 "sendMessage",
                 &serde_json::json!({
                     "chat_id": self.chat_id,
+                    "message_thread_id": self.thread_id,
                     "text": text,
                     "disable_notification": true,
                 }),
@@ -343,6 +428,20 @@ impl HaTelegramClient {
         Ok(())
     }
 
+    async fn ensure_pinned(&self, message_id: i64) -> Result<()> {
+        match self.pin_message(message_id).await {
+            Ok(()) => Ok(()),
+            Err(error)
+                if format!("{error:#}")
+                    .to_ascii_lowercase()
+                    .contains("already pinned") =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     async fn edit_document(&self, message_id: i64, document: &HaDocument) -> Result<()> {
         let text = encode_document(document)?;
         let _: Value = self
@@ -355,6 +454,45 @@ impl HaTelegramClient {
                 }),
             )
             .await?;
+        self.ensure_pinned(message_id).await?;
+        Ok(())
+    }
+
+    async fn get_updates(&self, offset: i64, timeout_secs: u64) -> Result<Vec<HaUpdate>> {
+        self.call(
+            "getUpdates",
+            &HaGetUpdatesBody {
+                offset,
+                timeout: timeout_secs,
+                allowed_updates: ["message"],
+            },
+        )
+        .await
+    }
+
+    fn accepts_admin(&self, message: &HaIncomingMessage) -> bool {
+        if message.chat.id != self.chat_id || message.message_thread_id != Some(self.thread_id) {
+            return false;
+        }
+        let Some(from) = message.from.as_ref() else {
+            return false;
+        };
+        from.id == self.operator_user_id && !from.is_bot
+    }
+
+    async fn send_admin(&self, text: &str) -> Result<()> {
+        for chunk in split_control_text(text, 3900) {
+            let _: Value = self
+                .call(
+                    "sendMessage",
+                    &serde_json::json!({
+                        "chat_id": self.chat_id,
+                        "message_thread_id": self.thread_id,
+                        "text": chunk,
+                    }),
+                )
+                .await?;
+        }
         Ok(())
     }
 
@@ -419,7 +557,12 @@ impl HaController {
         Some(format!("{}-{}-{nanos}", cfg.instance_id, process::id()))
     }
 
-    pub fn new(cfg: &HaConfig, process_nonce: Option<&str>) -> Result<Option<Self>> {
+    pub fn new(
+        cfg: &HaConfig,
+        telegram_chat_id: i64,
+        operator_user_id: i64,
+        process_nonce: Option<&str>,
+    ) -> Result<Option<Self>> {
         if !cfg.enabled {
             return Ok(None);
         }
@@ -432,11 +575,17 @@ impl HaController {
             });
         Ok(Some(Self {
             cfg: Arc::new(cfg.clone()),
-            api: HaTelegramClient::new(&cfg.control_bot_token, cfg.control_chat_id)?,
+            api: HaTelegramClient::new(
+                &cfg.control_bot_token,
+                telegram_chat_id,
+                cfg.control_thread_id,
+                operator_user_id,
+            )?,
             nonce: Arc::new(nonce),
             role: Arc::new(RwLock::new(LocalRole::Standby)),
             lease_expires_at_ms: Arc::new(Mutex::new(0)),
             claim_cooldown_until_ms: Arc::new(Mutex::new(0)),
+            state_message_id: Arc::new(Mutex::new(None)),
         }))
     }
 
@@ -453,7 +602,7 @@ impl HaController {
 
         let mut backoff = 1u64;
         loop {
-            match self.tick(&reddit).await {
+            match self.runtime_tick(&reddit).await {
                 Ok(()) => {
                     backoff = 1;
                     sleep(Duration::from_secs(CONTROL_POLL_SECS)).await;
@@ -563,6 +712,154 @@ impl HaController {
                     .await
             }
         }
+    }
+
+    async fn runtime_tick(&self, reddit: &RedditClient) -> Result<()> {
+        if let Err(error) = self.control_poller_tick().await {
+            warn!(
+                error = %format!("{error:#}"),
+                instance_id = %self.cfg.instance_id,
+                "HA admin control poller iteration failed"
+            );
+        }
+        self.tick(reddit).await
+    }
+
+    async fn control_poller_tick(&self) -> Result<()> {
+        let pinned = self.read_document().await?;
+        let document = pinned.document;
+        let now = now_ms();
+
+        if document.control_owner_is_live(now) {
+            if !self.control_owned_by_this_process(&document) {
+                return Ok(());
+            }
+
+            let renew_at_ms = document.control_lease_expires_at_ms.saturating_sub(
+                ((self.cfg.lease_ttl_secs - self.cfg.renew_interval_secs) as i64) * 1000,
+            );
+            if now >= renew_at_ms {
+                let instance_id = self.cfg.instance_id.clone();
+                let nonce = self.nonce.as_str().to_owned();
+                let ttl_ms = (self.cfg.lease_ttl_secs as i64) * 1000;
+                self.update_document(|current| {
+                    if current.control_owner.as_deref() == Some(instance_id.as_str())
+                        && current.control_owner_nonce.as_deref() == Some(nonce.as_str())
+                    {
+                        current.control_lease_expires_at_ms = now_ms().saturating_add(ttl_ms);
+                    }
+                    Ok(())
+                })
+                .await?;
+            }
+
+            return self.poll_control_updates().await;
+        }
+
+        let rank = members_by_priority(&self.cfg)
+            .iter()
+            .position(|member| member.id == self.cfg.instance_id)
+            .context("local HA member disappeared from configuration")?;
+        let base_ms = document
+            .control_lease_expires_at_ms
+            .max(document.written_at_ms);
+        let claim_at_ms =
+            base_ms.saturating_add((rank as i64).saturating_mul(CONTROL_CLAIM_STAGGER_MS));
+        if now < claim_at_ms {
+            return Ok(());
+        }
+
+        let instance_id = self.cfg.instance_id.clone();
+        let nonce = self.nonce.as_str().to_owned();
+        let ttl_ms = (self.cfg.lease_ttl_secs as i64) * 1000;
+        let claimed = self
+            .update_document(|current| {
+                let current_now = now_ms();
+                if current.control_owner_is_live(current_now) {
+                    return Ok(());
+                }
+                current.control_owner = Some(instance_id.clone());
+                current.control_owner_nonce = Some(nonce.clone());
+                current.control_lease_expires_at_ms = current_now.saturating_add(ttl_ms);
+                Ok(())
+            })
+            .await?;
+
+        if self.control_owned_by_this_process(&claimed) {
+            info!(
+                instance_id = %self.cfg.instance_id,
+                "HA admin control poller lease acquired"
+            );
+            self.poll_control_updates().await?;
+        }
+        Ok(())
+    }
+
+    async fn poll_control_updates(&self) -> Result<()> {
+        let offset = self.read_document().await?.document.control_update_offset;
+        let updates = self.api.get_updates(offset, 0).await?;
+
+        for update in updates {
+            let next_offset = update.update_id.saturating_add(1);
+            if let Some(message) = update.message.as_ref() {
+                if self.api.accepts_admin(message) {
+                    if let Some(text) = message.text.as_deref() {
+                        let mut parts = text.split_whitespace();
+                        let first = parts.next().unwrap_or("");
+                        let base = first.split('@').next().unwrap_or(first);
+                        if base == "/help" {
+                            if parts.next().is_none() {
+                                self.api.send_admin(control_help_text()).await?;
+                            } else {
+                                self.api.send_admin("Použití: /help").await?;
+                            }
+                        } else if let Some(command) = parse_command(text) {
+                            let response = match command {
+                                Ok(command) => {
+                                    self.execute_command(command, update.update_id).await?
+                                }
+                                Err(usage) => usage.to_owned(),
+                            };
+                            self.api.send_admin(&response).await?;
+                        }
+                    }
+                }
+            }
+            self.commit_control_update_offset(next_offset).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn commit_control_update_offset(&self, offset: i64) -> Result<()> {
+        self.update_document(|document| {
+            document.control_update_offset = document.control_update_offset.max(offset);
+            Ok(())
+        })
+        .await?;
+        Ok(())
+    }
+
+    pub async fn data_update_offset(&self) -> Result<i64> {
+        Ok(self.read_document().await?.document.data_update_offset)
+    }
+
+    pub async fn commit_data_update_offset(&self, offset: i64) -> Result<()> {
+        self.update_document(|document| {
+            document.data_update_offset = document.data_update_offset.max(offset);
+            Ok(())
+        })
+        .await?;
+        Ok(())
+    }
+
+    pub fn is_control_thread(&self, message_thread_id: Option<i64>) -> bool {
+        message_thread_id == Some(self.cfg.control_thread_id)
+    }
+
+    fn control_owned_by_this_process(&self, document: &HaDocument) -> bool {
+        document.control_owner.as_deref() == Some(self.cfg.instance_id.as_str())
+            && document.control_owner_nonce.as_deref() == Some(self.nonce.as_str())
     }
 
     async fn tick(&self, reddit: &RedditClient) -> Result<()> {
@@ -1413,10 +1710,29 @@ impl HaController {
         let pinned = self.read_document().await?;
         let document = pinned.document;
         let now = now_ms();
-        let mut lines = vec![format!(
-            "reddit2tg instances · cluster={} · generation={}",
-            self.cfg.cluster_id, document.generation
-        )];
+        let mut lines = vec![
+            format!(
+                "reddit2tg HA · cluster={} · generation={}",
+                self.cfg.cluster_id, document.generation
+            ),
+            format!(
+                "Reddit owner: {} · phase={}",
+                if document.owner_is_live(now) || document.claim_is_live(now) {
+                    document.owner.as_deref().unwrap_or("none")
+                } else {
+                    "none"
+                },
+                document.phase.as_str()
+            ),
+            format!(
+                "HA command poller: {}",
+                if document.control_owner_is_live(now) {
+                    document.control_owner.as_deref().unwrap_or("none")
+                } else {
+                    "none"
+                }
+            ),
+        ];
 
         for configured in members_by_priority(&self.cfg) {
             let mode = document.mode(&configured.id);
@@ -1444,8 +1760,10 @@ impl HaController {
             } else {
                 "-"
             };
-            let this = if configured.id == self.cfg.instance_id {
-                " this"
+            let control = if document.control_owner.as_deref() == Some(configured.id.as_str())
+                && document.control_owner_is_live(now)
+            {
+                " control"
             } else {
                 ""
             };
@@ -1457,13 +1775,10 @@ impl HaController {
                 mode.as_str(),
                 yes_no(configured.auto_failover),
                 yes_no(configured.auto_failback),
-                this
+                control
             ));
         }
-        lines.push(
-            "Pozn.: V2 odvozuje clusterovou živost z lease/claim; per-node last-seen heartbeat přijde v další vrstvě."
-                .to_owned(),
-        );
+
         Ok(lines.join("\n"))
     }
 
@@ -1471,21 +1786,31 @@ impl HaController {
         let pinned = self.read_document().await?;
         let document = pinned.document;
         let now = now_ms();
-        let role = *self.role.read().await;
         let lease_remaining = document.lease_expires_at_ms.saturating_sub(now).max(0) / 1000;
+        let control_remaining = document
+            .control_lease_expires_at_ms
+            .saturating_sub(now)
+            .max(0)
+            / 1000;
         Ok(format!(
-            "reddit2tg HA status\ncluster: {}\nthis: {}\nlocal role: {}\nphase: {}\nowner: {}\nowner priority: {}\nlease remaining: {}s\nhandover: {}\ncontrol generation: {}",
+            "reddit2tg HA status\ncluster: {}\nReddit phase: {}\nReddit owner: {}\nReddit lease: {}s\nhandover: {}\nHA command poller: {}\nHA command lease: {}s\ndata update offset: {}\ncontrol update offset: {}\ngeneration: {}",
             self.cfg.cluster_id,
-            self.cfg.instance_id,
-            role.as_str(),
             document.phase.as_str(),
-            document.owner.as_deref().unwrap_or("none"),
-            document
-                .owner_priority
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "-".to_owned()),
+            if document.owner_is_live(now) || document.claim_is_live(now) {
+                document.owner.as_deref().unwrap_or("none")
+            } else {
+                "none"
+            },
             lease_remaining,
             document.handover_to.as_deref().unwrap_or("none"),
+            if document.control_owner_is_live(now) {
+                document.control_owner.as_deref().unwrap_or("none")
+            } else {
+                "none"
+            },
+            control_remaining,
+            document.data_update_offset,
+            document.control_update_offset,
             document.generation
         ))
     }
@@ -1493,29 +1818,55 @@ impl HaController {
     async fn ensure_document(&self) -> Result<PinnedDocument> {
         if let Some(pinned) = self.api.read_pinned().await? {
             self.validate_document(&pinned.document)?;
+            *self.state_message_id.lock().await = Some(pinned.message_id);
             return Ok(pinned);
         }
 
         let document = HaDocument::new(&self.cfg, now_ms());
         let message_id = self.api.send_document(&document).await?;
-        self.api.pin_message(message_id).await?;
+        self.api.ensure_pinned(message_id).await?;
+        *self.state_message_id.lock().await = Some(message_id);
         sleep(Duration::from_millis(200)).await;
 
         let pinned = self.api.read_pinned().await?.context(
-            "HA control message was sent and pinned but getChat returned no pinned message",
+            "HA control state was sent into ha-control-room and pinned but getChat returned no pinned message",
         )?;
         self.validate_document(&pinned.document)?;
+        *self.state_message_id.lock().await = Some(pinned.message_id);
         Ok(pinned)
     }
 
     async fn read_document(&self) -> Result<PinnedDocument> {
-        let pinned = self
-            .api
-            .read_pinned()
-            .await?
-            .context("HA control chat has no pinned control document")?;
-        self.validate_document(&pinned.document)?;
-        Ok(pinned)
+        match self.api.read_pinned().await {
+            Ok(Some(pinned)) => {
+                self.validate_document(&pinned.document)?;
+                *self.state_message_id.lock().await = Some(pinned.message_id);
+                return Ok(pinned);
+            }
+            Ok(None) => {}
+            Err(first_error) => {
+                if let Some(message_id) = *self.state_message_id.lock().await {
+                    warn!(
+                        error = %format!("{first_error:#}"),
+                        message_id,
+                        "HA state is no longer the latest Telegram pin; trying to restore the cached state pin"
+                    );
+                    self.api.ensure_pinned(message_id).await?;
+                    sleep(Duration::from_millis(150)).await;
+                    let pinned = self
+                        .api
+                        .read_pinned()
+                        .await?
+                        .context("cached HA state message was re-pinned but getChat returned no pinned message")?;
+                    self.validate_document(&pinned.document)?;
+                    *self.state_message_id.lock().await = Some(pinned.message_id);
+                    return Ok(pinned);
+                }
+                return Err(first_error);
+            }
+        }
+
+        anyhow::bail!("Telegram supergroup has no pinned HA control document")
     }
 
     async fn update_document<F>(&self, mut mutate: F) -> Result<HaDocument>
@@ -1534,6 +1885,7 @@ impl HaController {
             next.generation = pinned.document.generation.saturating_add(1);
             next.written_at_ms = now_ms();
             self.api.edit_document(pinned.message_id, &next).await?;
+            *self.state_message_id.lock().await = Some(pinned.message_id);
 
             sleep(Duration::from_millis(120)).await;
             let verify = self.read_document().await?;
@@ -1562,7 +1914,7 @@ impl HaController {
     }
 
     fn request_id(&self, update_id: i64) -> String {
-        format!("{}-{update_id}", self.cfg.instance_id)
+        format!("control-{update_id}")
     }
 
     fn unknown_instance(&self, instance_id: &str) -> String {
@@ -1581,8 +1933,8 @@ pub fn validate_config(cfg: &HaConfig) -> Result<()> {
     if cfg.control_bot_token.trim().is_empty() {
         bail!("ha.control_bot_token must not be empty when HA is enabled");
     }
-    if cfg.control_chat_id == 0 {
-        bail!("ha.control_chat_id must not be 0 when HA is enabled");
+    if cfg.control_thread_id <= 1 {
+        bail!("ha.control_thread_id must be the numeric thread id of the reserved ha-control-room topic");
     }
     if !(15..=300).contains(&cfg.lease_ttl_secs) {
         bail!("ha.lease_ttl_secs must be in 15..300");
@@ -1663,7 +2015,15 @@ pub fn members_by_priority(cfg: &HaConfig) -> Vec<&HaInstanceConfig> {
 }
 
 pub fn members_fingerprint(cfg: &HaConfig) -> String {
-    let mut bytes = Vec::new();
+    let mut bytes = format!(
+        "thread={};ttl={};renew={};settle={};margin={};",
+        cfg.control_thread_id,
+        cfg.lease_ttl_secs,
+        cfg.renew_interval_secs,
+        cfg.claim_settle_secs,
+        cfg.fail_closed_margin_secs
+    )
+    .into_bytes();
     for configured in members_by_priority(cfg) {
         bytes.extend_from_slice(configured.id.as_bytes());
         bytes.push(b':');
@@ -1827,62 +2187,93 @@ pub fn should_auto_failback(
     candidate.auto_failback && candidate.priority < owner.priority
 }
 
+pub fn control_help_text() -> &'static str {
+    "reddit2tg HA control\n\
+/help — tato nápověda\n\
+/status — stav Reddit lease a HA command polleru\n\
+/instances — seznam nakonfigurovaných instancí\n\
+/switch <instance-id> — řízený handover\n\
+/connect <instance-id> [force] — aktivace cílové instance\n\
+/disconnect <instance-id> — administrativní odpojení bez automatického fallbacku\n\
+/maintenance <instance-id> [on|off] — stav nebo změna maintenance"
+}
+
+fn split_control_text(text: &str, limit: usize) -> Vec<String> {
+    if text.chars().count() <= limit {
+        return vec![text.to_owned()];
+    }
+
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if current.chars().count() >= limit {
+            parts.push(current);
+            current = String::new();
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    parts
+}
+
 pub fn parse_command(input: &str) -> Option<std::result::Result<HaCommand, &'static str>> {
     let mut parts = input.split_whitespace();
     let first = parts.next()?;
     let command = first.split('@').next().unwrap_or(first);
 
     match command {
-        "/list-instances" | "/list_instances" => {
+        "/instances" | "/list-instances" | "/list_instances" => {
             if parts.next().is_none() {
                 Some(Ok(HaCommand::ListInstances))
             } else {
-                Some(Err("Použití: /list-instances"))
+                Some(Err("Použití: /instances"))
             }
         }
-        "/reddit-status" | "/reddit_status" => {
+        "/status" | "/reddit-status" | "/reddit_status" => {
             if parts.next().is_none() {
                 Some(Ok(HaCommand::RedditStatus))
             } else {
-                Some(Err("Použití: /reddit-status"))
+                Some(Err("Použití: /status"))
             }
         }
-        "/reddit-connect" | "/reddit_connect" => {
+        "/connect" | "/reddit-connect" | "/reddit_connect" => {
             let Some(instance_id) = parts.next() else {
-                return Some(Err("Použití: /reddit-connect <instance-id> [force]"));
+                return Some(Err("Použití: /connect <instance-id> [force]"));
             };
             let force = match parts.next() {
                 None => false,
                 Some("force") => true,
                 Some(_) => {
-                    return Some(Err("Použití: /reddit-connect <instance-id> [force]"));
+                    return Some(Err("Použití: /connect <instance-id> [force]"));
                 }
             };
             if parts.next().is_some() {
-                return Some(Err("Použití: /reddit-connect <instance-id> [force]"));
+                return Some(Err("Použití: /connect <instance-id> [force]"));
             }
             Some(Ok(HaCommand::Connect {
                 instance_id: instance_id.to_owned(),
                 force,
             }))
         }
-        "/reddit-disconnect" | "/reddit_disconnect" => {
+        "/disconnect" | "/reddit-disconnect" | "/reddit_disconnect" => {
             let Some(instance_id) = parts.next() else {
-                return Some(Err("Použití: /reddit-disconnect <instance-id>"));
+                return Some(Err("Použití: /disconnect <instance-id>"));
             };
             if parts.next().is_some() {
-                return Some(Err("Použití: /reddit-disconnect <instance-id>"));
+                return Some(Err("Použití: /disconnect <instance-id>"));
             }
             Some(Ok(HaCommand::Disconnect {
                 instance_id: instance_id.to_owned(),
             }))
         }
-        "/reddit-switch" | "/reddit_switch" => {
+        "/switch" | "/reddit-switch" | "/reddit_switch" => {
             let Some(instance_id) = parts.next() else {
-                return Some(Err("Použití: /reddit-switch <instance-id>"));
+                return Some(Err("Použití: /switch <instance-id>"));
             };
             if parts.next().is_some() {
-                return Some(Err("Použití: /reddit-switch <instance-id>"));
+                return Some(Err("Použití: /switch <instance-id>"));
             }
             Some(Ok(HaCommand::Switch {
                 instance_id: instance_id.to_owned(),
@@ -1943,7 +2334,7 @@ mod tests {
             cluster_id: "prod".to_owned(),
             instance_id: "ostrava".to_owned(),
             control_bot_token: "123:test".to_owned(),
-            control_chat_id: -100123,
+            control_thread_id: 777,
             lease_ttl_secs: 30,
             renew_interval_secs: 10,
             claim_settle_secs: 5,
@@ -2097,7 +2488,7 @@ mod tests {
     #[test]
     fn process_incarnation_is_part_of_ownership() {
         let config = cfg();
-        let controller = HaController::new(&config, Some("ostrava-new"))
+        let controller = HaController::new(&config, -100123, 123456, Some("ostrava-new"))
             .unwrap()
             .unwrap();
         let mut document = HaDocument::new(&config, 1000);
@@ -2152,6 +2543,27 @@ mod tests {
             parse_command("/reddit-status"),
             Some(Ok(HaCommand::RedditStatus))
         );
+        assert_eq!(parse_command("/status"), Some(Ok(HaCommand::RedditStatus)));
+        assert_eq!(
+            parse_command("/instances"),
+            Some(Ok(HaCommand::ListInstances))
+        );
+        assert_eq!(
+            parse_command("/switch brno"),
+            Some(Ok(HaCommand::Switch {
+                instance_id: "brno".to_owned(),
+            }))
+        );
+    }
+
+    #[test]
+    fn control_document_starts_with_shared_offsets_and_no_control_owner() {
+        let config = cfg();
+        let document = HaDocument::new(&config, 1_000);
+        assert_eq!(document.control_update_offset, 0);
+        assert_eq!(document.data_update_offset, 0);
+        assert_eq!(document.control_owner, None);
+        assert!(!document.control_owner_is_live(1_001));
     }
 
     #[test]

@@ -50,7 +50,12 @@ fn build_bridge(cfg: &Config, db: &Db, ha_process_nonce: Option<&str>) -> Result
         cfg.telegram.chat_id,
         cfg.telegram.operator_user_id,
     )?;
-    let ha = HaController::new(&cfg.ha, ha_process_nonce)?;
+    let ha = HaController::new(
+        &cfg.ha,
+        cfg.telegram.chat_id,
+        cfg.telegram.operator_user_id,
+        ha_process_nonce,
+    )?;
     Ok(Bridge::new(cfg.clone(), db.clone(), reddit, telegram, ha))
 }
 

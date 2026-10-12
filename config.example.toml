@@ -22,19 +22,25 @@ telegram_timeout_secs = 45
 refresh_before_secs = 3600
 
 # Optional multi-instance HA control plane. Keep disabled for a single instance.
-# All HA nodes in one cluster must use the same cluster_id, control_bot_token,
-# control_chat_id and identical [[ha.instances]] membership/policies.
-# Each node sets only ha.instance_id to its own member id.
 #
-# The control bot is separate from telegram.bot_token and is reserved for HA
-# lease/control state. A pinned control message is the fencing token; Reddit
-# authentication and bridging are allowed only to the current lease owner.
+# HA uses the SAME Telegram forum supergroup as [telegram]. All nodes use the
+# same telegram.bot_token (data bot), but only the active Reddit lease owner
+# calls getUpdates on that bot.
+#
+# HA administration uses one separate shared control bot. Create one reserved
+# forum topic named "ha-control-room" in telegram.chat_id and set its numeric
+# message_thread_id below. All HA commands and the pinned HA state live there.
+#
+# All HA nodes in one cluster must use the same cluster_id, control_bot_token,
+# control_thread_id, lease timings and identical [[ha.instances]] membership.
+# Each node changes only ha.instance_id. The long-lived Reddit browser session
+# must also be available on every node that may become active.
 [ha]
 enabled = false
 # cluster_id = "prod"
 # instance_id = "ostrava"
 # control_bot_token = "123456789:PASTE_SHARED_HA_CONTROL_BOT_TOKEN_HERE"
-# control_chat_id = -1009876543210
+# control_thread_id = 12345
 # lease_ttl_secs = 30
 # renew_interval_secs = 10
 # claim_settle_secs = 5

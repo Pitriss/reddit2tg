@@ -38,29 +38,472 @@ The default history limit is 50 replayable text/notice/image events and the acce
 
 ### Multi-instance HA
 
-Optional HA mode allows multiple reddit2tg instances to stay online while only one instance owns the Reddit/Matrix session at a time.
+> **Status: experimental / alpha.**
+>
+> The HA lease/control plane is implemented, but bridge SQLite state is not yet
+> replicated between nodes. Read the state-replication limitation below before
+> enabling unattended production failover.
 
-- every instance has a unique `ha.instance_id` and configured priority; lower numeric priority wins
-- all nodes share a dedicated HA control bot and a dedicated Telegram control group/supergroup
-- the HA control bot does not use `getUpdates`; nodes coordinate through the latest pinned control document
-- the normal `telegram.bot_token` remains the data-plane bot for that instance
-- the pinned document contains a lease plus a process-incarnation nonce
-- claims use a deterministic priority delay plus a settle window
-- Reddit authentication starts only after a claim survives the settle window
-- active Reddit work is lease-bounded and fails closed before lease expiry
-- `auto_failback = true` can request coordinated handover back to a better-priority node
-- maintenance mode keeps HA control commands alive while disabling Reddit communication
+HA mode allows multiple `reddit2tg` processes to run at different locations
+while only one process at a time is allowed to authenticate to Reddit/Matrix
+and poll the normal Telegram data bot.
 
-General commands:
+The user-facing Telegram layout stays simple: **one existing forum supergroup,
+two bots, one reserved control topic, any number of instances**.
 
-- `/list-instances`
-- `/reddit-status`
-- `/reddit-connect <instance-id> [force]`
-- `/reddit-disconnect <instance-id>`
-- `/reddit-switch <instance-id>`
-- `/maintenance <instance-id> [on|off]`
+```text
+Telegram forum supergroup
+├── General
+├── Reddit user topics...
+└── ha-control-room
+      ├── HA commands
+      └── pinned reddit2tg HA state
+```
 
-`/reddit-disconnect` is an administrative stop and does not itself trigger automatic handover. The HA control chat should be dedicated to reddit2tg and the control bot must be allowed to pin messages.
+The two bots are:
+
+- **data bot** — the normal `telegram.bot_token`; the same token is configured
+  on every HA node, but only the active Reddit lease owner calls `getUpdates`
+- **HA control bot** — `ha.control_bot_token`; one cluster-elected node polls it
+  and processes commands only inside `ha-control-room`
+
+The control bot token must be different from the data bot token.
+
+For three instances the topology is therefore still only two Telegram bots:
+
+```text
+                       Reddit
+                         |
+                  current ACTIVE
+                         |
+                 shared data bot
+                         |
+             existing Telegram forum
+                         |
+                 ha-control-room
+                         |
+                 shared HA bot
+                         |
+              +----------+----------+
+              |          |          |
+           ostrava      brno       praha
+           prio 10     prio 20    prio 30
+```
+
+Lower numeric priority is preferred.
+
+#### Create the HA control bot
+
+When converting an existing non-HA installation to HA, **keep the current
+reddit2tg bot unchanged**. It remains the shared data bot configured as:
+
+```toml
+[telegram]
+bot_token = "EXISTING_REDDIT2TG_BOT_TOKEN"
+chat_id = -1001234567890
+operator_user_id = 123456789
+```
+
+Create exactly one additional Telegram bot for HA control.
+
+Open a private chat with the official `@BotFather` account and send:
+
+```text
+/newbot
+```
+
+Choose a display name, for example:
+
+```text
+reddit2tg HA
+```
+
+and then a unique bot username, for example:
+
+```text
+my_reddit2tg_ha_bot
+```
+
+BotFather returns a Bot API token. Store that token as:
+
+```toml
+[ha]
+control_bot_token = "NEW_HA_CONTROL_BOT_TOKEN"
+```
+
+The HA bot must be different from `telegram.bot_token`. `reddit2tg check`
+rejects a configuration that uses the same token for both roles.
+
+Treat both bot tokens as passwords. Do not commit them, paste them into issues,
+or leave them in shell history.
+
+Load the HA token temporarily without echoing it:
+
+```sh
+read -rsp 'HA control bot token: ' HA_BOT_TOKEN; echo; export HA_BOT_TOKEN
+```
+
+Verify that it belongs to the expected bot:
+
+```sh
+curl -sS "https://api.telegram.org/bot${HA_BOT_TOKEN}/getMe" | jq .
+```
+
+The response should contain `"ok": true` and the expected HA bot username.
+
+Verify that no webhook is configured:
+
+```sh
+curl -sS "https://api.telegram.org/bot${HA_BOT_TOKEN}/getWebhookInfo" | jq .result
+```
+
+The `.url` field must be empty. If this bot was used elsewhere and still has a
+webhook, remove it:
+
+```sh
+curl -sS "https://api.telegram.org/bot${HA_BOT_TOKEN}/deleteWebhook" | jq .
+```
+
+Do not use `drop_pending_updates=true` unless pending HA bot updates should
+intentionally be discarded.
+
+Add the new HA bot to the **same existing Telegram forum supergroup** used by
+`reddit2tg`.
+
+Promote it to administrator and grant only the permission required by the
+current HA implementation:
+
+```text
+Pin Messages / Připínat zprávy: YES
+Manage Topics / Spravovat témata: NO
+Delete Messages: NO
+Ban/Restrict Users: NO
+Invite Users: NO
+Promote Admins: NO
+Manage Video Chats: NO
+```
+
+The HA control topic is created manually by the operator, so the HA bot does not
+need `Manage Topics`.
+
+The existing data bot keeps its current administrator permissions, including
+`Manage Topics`.
+
+Telegram Group Privacy Mode does not need to be disabled for the HA bot because
+it is an administrator of the supergroup.
+
+#### Create `ha-control-room`
+
+In the existing Telegram forum supergroup used by `reddit2tg`:
+
+1. create a normal forum topic named exactly `ha-control-room`
+2. add the HA control bot to the same supergroup
+3. promote it to administrator and allow it to pin messages
+4. keep the existing data bot in the group with its normal **Manage Topics**
+   permission
+5. obtain the numeric `message_thread_id` of `ha-control-room`
+
+Before starting the HA daemon, the thread ID can be obtained by sending a
+temporary message in `ha-control-room` and querying the HA bot:
+
+```sh
+read -rsp 'HA bot token: ' HA_BOT_TOKEN; echo; export HA_BOT_TOKEN
+```
+
+```sh
+curl -sS "https://api.telegram.org/bot${HA_BOT_TOKEN}/getUpdates" | jq -r '.result[] | select(.message.message_thread_id != null) | "\(.message.message_thread_id)  \(.message.text // "")"'
+```
+
+Use the thread ID belonging to the temporary message as:
+
+```toml
+ha.control_thread_id = 12345
+```
+
+Then remove the temporary shell variable:
+
+```sh
+unset HA_BOT_TOKEN
+```
+
+The topic is reserved by `reddit2tg`. Ordinary data-bot traffic from that
+thread is ignored. If a Reddit counterpart is literally named
+`ha-control-room`, its Telegram topic is created with a `Reddit · ` prefix
+instead.
+
+#### HA configuration
+
+Example three-node membership:
+
+```toml
+[ha]
+enabled = true
+cluster_id = "prod"
+instance_id = "ostrava"
+
+control_bot_token = "123456789:SHARED_HA_CONTROL_BOT_TOKEN"
+control_thread_id = 12345
+
+lease_ttl_secs = 30
+renew_interval_secs = 10
+claim_settle_secs = 5
+fail_closed_margin_secs = 5
+
+[[ha.instances]]
+id = "ostrava"
+priority = 10
+auto_failover = true
+allow_fallback = true
+auto_failback = false
+
+[[ha.instances]]
+id = "brno"
+priority = 20
+auto_failover = true
+allow_fallback = true
+auto_failback = false
+
+[[ha.instances]]
+id = "praha"
+priority = 30
+auto_failover = true
+allow_fallback = true
+auto_failback = false
+```
+
+All nodes in one cluster must share:
+
+- `telegram.bot_token`
+- `telegram.chat_id`
+- `telegram.operator_user_id`
+- `ha.cluster_id`
+- `ha.control_bot_token`
+- `ha.control_thread_id`
+- all lease timing values
+- the complete ordered-equivalent `[[ha.instances]]` membership/policies
+
+Only `ha.instance_id` identifies the local node and therefore differs between
+nodes.
+
+The HA control document includes a fingerprint of the control-thread ID, lease
+timings and complete member policy. A mismatching node fails closed instead of
+participating with different election rules.
+
+Every node that may become active must also contain a valid `reddit.session`.
+Standby nodes keep the credential configured but do not authenticate Reddit
+until they own a settled Reddit lease.
+
+#### What the two leases do
+
+The pinned HA document coordinates two independent roles:
+
+1. **Reddit owner** — may authenticate Matrix, poll Reddit and poll the shared
+   Telegram data bot
+2. **HA command poller** — may poll the shared HA bot and answer commands in
+   `ha-control-room`
+
+The second role exists so HA administration still works when the Reddit role is
+paused, disconnected or between owners.
+
+Both roles include the process-incarnation nonce, so a restarted process cannot
+inherit a live lease merely by reusing the same `instance_id`.
+
+The Reddit owner performs:
+
+```text
+standby -> claim -> settle -> Reddit authentication -> active
+```
+
+Reddit authentication starts only after the claim survives
+`claim_settle_secs`.
+
+Active Reddit and Telegram-data operations are bounded by:
+
+```text
+lease expiry - fail_closed_margin_secs
+```
+
+If the HA state cannot be safely renewed, new Reddit work stops before another
+node may take over.
+
+The shared data-bot update offset is stored in the HA document rather than only
+in a node-local SQLite database. A new active node therefore continues the same
+Telegram `getUpdates` stream instead of starting from that machine's old local
+offset.
+
+The HA-bot update offset is stored in the same document, allowing another node
+to take over HA command polling after the command-poller lease expires.
+
+#### HA commands
+
+Send HA commands **only inside `ha-control-room`** from the configured
+`telegram.operator_user_id`.
+
+Recommended short commands:
+
+```text
+/help
+/status
+/instances
+/switch <instance-id>
+/connect <instance-id> [force]
+/disconnect <instance-id>
+/maintenance <instance-id> [on|off]
+```
+
+The older names remain accepted as aliases:
+
+```text
+/reddit-status
+/list-instances
+/reddit-switch <instance-id>
+/reddit-connect <instance-id> [force]
+/reddit-disconnect <instance-id>
+```
+
+Examples:
+
+```text
+/status
+```
+
+```text
+/switch brno
+```
+
+```text
+/maintenance ostrava on
+```
+
+```text
+/disconnect praha
+```
+
+```text
+/connect praha
+```
+
+`/disconnect` is an explicit administrative stop and does not itself trigger
+automatic fallback.
+
+`/maintenance <id> on` removes the selected instance from Reddit candidacy but
+does not stop the process from participating in the HA command-poller election.
+
+With `auto_failback = false` (recommended), a recovered higher-priority node
+does not automatically steal the Reddit role from a healthy lower-priority
+owner.
+
+#### Convert an existing non-HA installation
+
+Use the existing reddit2tg bot as the data bot. The new bot created above is
+used only for HA control.
+
+Do **not** swap their roles.
+
+Recommended migration order:
+
+```text
+1. keep the existing data bot unchanged
+2. create the new HA control bot
+3. add the HA bot to the existing Telegram forum
+4. grant the HA bot Pin Messages permission
+5. create ha-control-room
+6. determine ha.control_thread_id
+7. prepare identical HA membership on all planned nodes
+8. keep the current production non-HA process running until configuration is ready
+9. stop the old non-HA reddit2tg process
+10. start only the preferred HA node
+11. verify that it becomes ACTIVE
+12. start the second node and verify STANDBY
+13. start any remaining nodes
+```
+
+Never run the old non-HA process and the new HA runtime simultaneously with the
+same `telegram.bot_token`. The non-HA process does not understand the HA lease
+and would compete for the shared data bot's `getUpdates` stream.
+
+For a three-node cluster all nodes therefore contain the same two bot tokens:
+
+```text
+telegram.bot_token     = existing shared reddit2tg data bot
+ha.control_bot_token   = new shared HA control bot
+```
+
+Only `ha.instance_id` differs by node.
+
+#### Adding another instance
+
+To add a new node such as `brno`:
+
+1. install the same `reddit2tg` version on the new host
+2. copy the shared data-bot token and the same Telegram forum/operator IDs
+3. copy the shared HA control-bot token and `ha-control_thread_id`
+4. configure the same Reddit browser session
+5. add `brno` to `[[ha.instances]]` on **every** node
+6. set `ha.instance_id = "brno"` only on the new node
+7. update/restart the existing nodes so all members have the same membership
+   fingerprint
+8. run `reddit2tg check` on the new node
+9. start the new service
+
+In HA mode:
+
+```sh
+sudo -u reddit2tg /usr/bin/reddit2tg --config /etc/reddit2tg/config.toml check
+```
+
+checks the data bot and HA control plane but intentionally does **not**
+authenticate Reddit.
+
+Start the first HA node and let it create/pin the control document before
+starting additional nodes. This avoids an unnecessary first-bootstrap race.
+
+#### Pinned HA state
+
+The HA state message is sent inside `ha-control-room` and is maintained only by
+`reddit2tg`. Do not edit or delete it.
+
+The Telegram Bot API `getChat` interface exposes the latest pinned message for
+the chat, not a transactional topic-scoped key/value store. `reddit2tg`
+therefore verifies that the latest pin belongs to the configured
+`ha-control-room` and contains a valid HA document. While running, a node that
+already knows the HA state message ID can re-pin it if another message
+temporarily becomes the latest pin.
+
+If all nodes restart while another message is the latest pin, HA intentionally
+fails closed. Re-pin the reddit2tg HA state message in `ha-control-room` before
+starting the cluster again.
+
+This Telegram fencing scheme reduces write races with deterministic election,
+generation checks, claim settling, process nonces and read-after-write
+verification, but it is not equivalent to an atomic etcd/Raft-style consensus
+store.
+
+#### Important alpha limitation: SQLite bridge state is not replicated
+
+HA currently coordinates **ownership**, but each host still has its own local
+SQLite database containing:
+
+- Matrix room -> Telegram topic mappings
+- Matrix sync checkpoint
+- Matrix event deduplication
+- Reddit -> Telegram message mappings
+- pending read markers
+- short-lived Matrix authentication state
+- per-chat settings
+
+The Telegram data-bot offset is shared through the HA document in HA mode, but
+the rest of this bridge state is not yet replicated.
+
+For an initial controlled two-node test, start both nodes from a consistent
+SQLite snapshot taken while the original bridge is stopped. After traffic
+continues, the databases may diverge again.
+
+Do not point several running instances at one SQLite file on NFS or another
+network filesystem. Shared-network SQLite is not a supported HA backend.
+
+Seamless unattended production failover still requires a shared or replicated
+bridge-state design and remains future work.
 
 ### Authentication and recovery
 
@@ -107,7 +550,7 @@ The bridge intentionally does not modify an operator-authored Telegram source me
 
 ## Configuration values
 
-`reddit2tg` needs four account-specific values:
+`reddit2tg` single-instance mode needs four account-specific values. HA mode additionally needs one shared HA control-bot token, the reserved `ha-control-room` thread ID, and a unique `ha.instance_id` per node:
 
 | Config key | Meaning |
 | --- | --- |
@@ -374,7 +817,7 @@ For a foreground test on the build machine:
 
 Stop it with `Ctrl+C`.
 
-Do not simultaneously run another process using `getUpdates` with the same Telegram bot token. Bot API updates are a single stream and competing consumers will interfere with each other.
+Outside HA mode, do not simultaneously run another process using `getUpdates` with the same Telegram bot token. In HA mode the data-bot token is intentionally shared, but the lease gate guarantees that only the current active node polls it; the HA control bot has an independent cluster-elected poller.
 
 ### Runtime communication recovery
 

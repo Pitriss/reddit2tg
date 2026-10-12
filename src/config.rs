@@ -74,7 +74,7 @@ pub struct HaConfig {
     #[serde(default)]
     pub control_bot_token: String,
     #[serde(default)]
-    pub control_chat_id: i64,
+    pub control_thread_id: i64,
     #[serde(default = "default_ha_lease_ttl_secs")]
     pub lease_ttl_secs: u64,
     #[serde(default = "default_ha_renew_interval_secs")]
@@ -94,7 +94,7 @@ impl Default for HaConfig {
             cluster_id: String::new(),
             instance_id: String::new(),
             control_bot_token: String::new(),
-            control_chat_id: 0,
+            control_thread_id: 0,
             lease_ttl_secs: default_ha_lease_ttl_secs(),
             renew_interval_secs: default_ha_renew_interval_secs(),
             claim_settle_secs: default_ha_claim_settle_secs(),
@@ -171,6 +171,9 @@ impl Config {
         }
         if self.telegram.operator_user_id <= 0 {
             bail!("telegram.operator_user_id must be positive");
+        }
+        if self.ha.enabled && self.ha.control_bot_token.trim() == self.telegram.bot_token.trim() {
+            bail!("ha.control_bot_token must use a separate bot from telegram.bot_token");
         }
         if self.bridge.matrix_timeout_ms < 1_000 || self.bridge.matrix_timeout_ms > 60_000 {
             bail!("bridge.matrix_timeout_ms must be in 1000..60000");
