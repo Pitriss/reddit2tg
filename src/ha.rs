@@ -28,6 +28,8 @@ const HA_LEGACY_CONTROL_PREFIX: &str = "reddit2tg-ha-v2\n";
 pub const HA_CONTROL_TOPIC_NAME: &str = "ha-control-room";
 pub const HA_SYNC_TOPIC_NAME: &str = "ha-sync";
 const CONTROL_POLL_SECS: u64 = 2;
+const LEASE_RETRY_MAX_SECS: u64 = 2;
+const CONTROL_REQUEST_TIMEOUT_MAX_SECS: u64 = 4;
 const REPLICATION_PAYLOAD_PROTOCOL: u32 = 2;
 const REPLICATION_EPOCH_META: &str = "ha_replication_epoch";
 const REPLICATION_DELTA_CHANGE_LIMIT: usize = 512;
@@ -373,6 +375,7 @@ struct HaTelegramClient {
     chat_id: i64,
     thread_id: i64,
     operator_user_id: i64,
+    control_request_timeout: Duration,
 }
 
 #[derive(Debug, Deserialize)]
@@ -422,7 +425,13 @@ struct HaGetUpdatesBody {
 }
 
 impl HaTelegramClient {
-    fn new(bot_token: &str, chat_id: i64, thread_id: i64, operator_user_id: i64) -> Result<Self> {
+    fn new(
+        bot_token: &str,
+        chat_id: i64,
+        thread_id: i64,
+        operator_user_id: i64,
+        control_request_timeout: Duration,
+    ) -> Result<Self> {
         let http = Client::builder().timeout(Duration::from_secs(30)).build()?;
         let token = bot_token.trim();
         Ok(Self {
@@ -432,6 +441,7 @@ impl HaTelegramClient {
             chat_id,
             thread_id,
             operator_user_id,
+            control_request_timeout,
         })
     }
 
@@ -808,46 +818,57 @@ impl HaTelegramClient {
         body: &B,
     ) -> Result<T> {
         let url = format!("{}/{}", self.base, method);
+        let call = async {
+            for retry in 0..=MAX_CONTROL_RATE_LIMIT_RETRIES {
+                let response = self
+                    .http
+                    .post(&url)
+                    .timeout(self.control_request_timeout)
+                    .json(body)
+                    .send()
+                    .await
+                    .with_context(|| format!("HA Telegram {method} request failed"))?;
+                let status = response.status();
+                let parsed: ApiResponse<T> = response.json().await.with_context(|| {
+                    format!("HA Telegram {method} returned invalid JSON (HTTP {status})")
+                })?;
 
-        for retry in 0..=MAX_CONTROL_RATE_LIMIT_RETRIES {
-            let response = self
-                .http
-                .post(&url)
-                .json(body)
-                .send()
-                .await
-                .with_context(|| format!("HA Telegram {method} request failed"))?;
-            let status = response.status();
-            let parsed: ApiResponse<T> = response.json().await.with_context(|| {
-                format!("HA Telegram {method} returned invalid JSON (HTTP {status})")
-            })?;
-
-            if parsed.ok {
-                return parsed.result.ok_or_else(|| {
-                    anyhow::anyhow!("HA Telegram {method} returned ok without result")
-                });
-            }
-
-            if let Some(retry_after) = parsed
-                .parameters
-                .as_ref()
-                .and_then(|parameters| parameters.retry_after)
-            {
-                if retry < MAX_CONTROL_RATE_LIMIT_RETRIES {
-                    sleep(Duration::from_secs(retry_after.saturating_add(1))).await;
-                    continue;
+                if parsed.ok {
+                    return parsed.result.ok_or_else(|| {
+                        anyhow::anyhow!("HA Telegram {method} returned ok without result")
+                    });
                 }
+
+                if let Some(retry_after) = parsed
+                    .parameters
+                    .as_ref()
+                    .and_then(|parameters| parameters.retry_after)
+                {
+                    if retry < MAX_CONTROL_RATE_LIMIT_RETRIES {
+                        sleep(Duration::from_secs(retry_after.saturating_add(1))).await;
+                        continue;
+                    }
+                }
+
+                bail!(
+                    "HA Telegram {method} failed (HTTP {status}): {}",
+                    parsed
+                        .description
+                        .unwrap_or_else(|| "unknown error".to_owned())
+                );
             }
 
-            bail!(
-                "HA Telegram {method} failed (HTTP {status}): {}",
-                parsed
-                    .description
-                    .unwrap_or_else(|| "unknown error".to_owned())
-            );
-        }
+            unreachable!()
+        };
 
-        unreachable!()
+        tokio::time::timeout(self.control_request_timeout, call)
+            .await
+            .with_context(|| {
+                format!(
+                    "HA Telegram {method} call exceeded control deadline of {:?}",
+                    self.control_request_timeout
+                )
+            })?
     }
 }
 
@@ -886,6 +907,7 @@ impl HaController {
                 telegram_chat_id,
                 cfg.control_thread_id,
                 operator_user_id,
+                control_request_timeout(cfg),
             )?,
             nonce: Arc::new(nonce),
             role: Arc::new(RwLock::new(LocalRole::Standby)),
@@ -911,26 +933,16 @@ impl HaController {
         self.force_local_standby(&reddit).await?;
         self.ensure_document().await?;
 
-        let mut backoff = 1u64;
-        loop {
-            match self.runtime_tick(&reddit, &db).await {
-                Ok(()) => {
-                    backoff = 1;
-                    sleep(Duration::from_secs(CONTROL_POLL_SECS)).await;
-                }
-                Err(error) => {
-                    warn!(
-                        error = %format!("{error:#}"),
-                        backoff_secs = backoff,
-                        instance_id = %self.cfg.instance_id,
-                        "HA control iteration failed"
-                    );
-                    self.fail_closed_if_needed(&reddit).await;
-                    sleep(Duration::from_secs(backoff)).await;
-                    backoff = (backoff * 2).min(10);
-                }
-            }
-        }
+        // Lease/election work must never wait behind replication I/O. Alpha3
+        // ran replication_tick() before tick(), so a slow Telegram file upload
+        // could consume the whole lease window and make the active node fence
+        // itself before it got a chance to renew.
+        supervise_ha_runtime(
+            self.lease_runtime_loop(&reddit, &db),
+            self.admin_runtime_loop(),
+            self.replication_runtime_loop(&db),
+        )
+        .await
     }
 
     pub async fn shutdown(&self, reddit: &RedditClient, db: &Db) {
@@ -1045,17 +1057,77 @@ impl HaController {
         }
     }
 
-    async fn runtime_tick(&self, reddit: &RedditClient, db: &Db) -> Result<()> {
-        if let Err(error) = self.control_poller_tick().await {
-            warn!(
-                error = %format!("{error:#}"),
-                instance_id = %self.cfg.instance_id,
-                "HA admin control poller iteration failed"
-            );
+    async fn lease_runtime_loop(&self, reddit: &RedditClient, db: &Db) -> Result<()> {
+        let mut backoff = 1u64;
+        loop {
+            match self.tick(reddit, db).await {
+                Ok(()) => {
+                    backoff = 1;
+                    sleep(Duration::from_secs(CONTROL_POLL_SECS)).await;
+                }
+                Err(error) => {
+                    warn!(
+                        error = %format!("{error:#}"),
+                        backoff_secs = backoff,
+                        instance_id = %self.cfg.instance_id,
+                        "HA lease iteration failed"
+                    );
+                    self.fail_closed_if_needed(reddit).await;
+                    sleep(Duration::from_secs(backoff)).await;
+                    backoff = (backoff * 2).min(LEASE_RETRY_MAX_SECS);
+                }
+            }
         }
-        self.ensure_sync_topic().await?;
-        self.replication_tick(db).await?;
-        self.tick(reddit, db).await
+    }
+
+    async fn admin_runtime_loop(&self) -> Result<()> {
+        let mut backoff = 1u64;
+        loop {
+            match self.control_poller_tick().await {
+                Ok(()) => {
+                    backoff = 1;
+                    sleep(Duration::from_secs(CONTROL_POLL_SECS)).await;
+                }
+                Err(error) => {
+                    warn!(
+                        error = %format!("{error:#}"),
+                        backoff_secs = backoff,
+                        instance_id = %self.cfg.instance_id,
+                        "HA admin control poller iteration failed"
+                    );
+                    sleep(Duration::from_secs(backoff)).await;
+                    backoff = (backoff * 2).min(10);
+                }
+            }
+        }
+    }
+
+    async fn replication_runtime_loop(&self, db: &Db) -> Result<()> {
+        let mut backoff = 1u64;
+        loop {
+            let iteration = async {
+                self.ensure_sync_topic().await?;
+                self.replication_tick(db).await
+            }
+            .await;
+
+            match iteration {
+                Ok(()) => {
+                    backoff = 1;
+                    sleep(Duration::from_secs(CONTROL_POLL_SECS)).await;
+                }
+                Err(error) => {
+                    warn!(
+                        error = %format!("{error:#}"),
+                        backoff_secs = backoff,
+                        instance_id = %self.cfg.instance_id,
+                        "HA replication iteration failed"
+                    );
+                    sleep(Duration::from_secs(backoff)).await;
+                    backoff = (backoff * 2).min(10);
+                }
+            }
+        }
     }
 
     async fn control_poller_tick(&self) -> Result<()> {
@@ -3436,9 +3508,10 @@ impl HaController {
     where
         F: FnMut(&mut HaDocument) -> Result<()>,
     {
-        // All clones of one HaController share this mutex. Without it the
-        // local lease-renewal task and data/control offset writers can race
-        // each other through Telegram's non-CAS editMessageText API.
+        // Keep the whole read->edit->verify retry sequence serialized locally.
+        // Telegram getChat may briefly return the pre-edit pinned document after
+        // a successful editMessageText; releasing this mutex before verification
+        // would let another local writer build on stale state and clobber a write.
         let _write_guard = self.document_write_lock.lock().await;
         let mut last_written: Option<(i64, HaDocument)> = None;
 
@@ -3501,6 +3574,30 @@ impl HaController {
     fn unknown_instance(&self, instance_id: &str) -> String {
         format!("Neznámá instance: {instance_id}. Použij /list-instances.")
     }
+}
+
+async fn supervise_ha_runtime<L, A, R>(lease: L, admin: A, replication: R) -> Result<()>
+where
+    L: std::future::Future<Output = Result<()>>,
+    A: std::future::Future<Output = Result<()>>,
+    R: std::future::Future<Output = Result<()>>,
+{
+    tokio::pin!(lease);
+    tokio::pin!(admin);
+    tokio::pin!(replication);
+
+    tokio::select! {
+        result = &mut lease => result.context("HA lease runtime loop stopped"),
+        result = &mut admin => result.context("HA admin runtime loop stopped"),
+        result = &mut replication => result.context("HA replication runtime loop stopped"),
+    }
+}
+
+fn control_request_timeout(cfg: &HaConfig) -> Duration {
+    let renew_ms = cfg.renew_interval_secs.saturating_mul(1000);
+    let timeout_ms =
+        (renew_ms / 2).clamp(1_000, CONTROL_REQUEST_TIMEOUT_MAX_SECS.saturating_mul(1000));
+    Duration::from_millis(timeout_ms)
 }
 
 pub fn validate_config(cfg: &HaConfig) -> Result<()> {
@@ -4075,6 +4172,164 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[tokio::test]
+    async fn telegram_control_call_has_total_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local test listener");
+        let addr = listener.local_addr().expect("local listener address");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept test connection");
+
+            let mut request = [0u8; 4096];
+            stream
+                .readable()
+                .await
+                .expect("test connection should become readable");
+            let _ = stream.try_read(&mut request);
+
+            let body =
+                r#"{"ok":false,"description":"Too Many Requests","parameters":{"retry_after":5}}"#;
+            let response = format!(
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+
+            stream
+                .writable()
+                .await
+                .expect("test connection should become writable");
+            let written = stream
+                .try_write(response.as_bytes())
+                .expect("write test 429 response");
+            assert_eq!(written, response.len());
+        });
+
+        let client = HaTelegramClient {
+            http: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .expect("build test HTTP client"),
+            base: format!("http://{addr}"),
+            file_base: format!("http://{addr}"),
+            chat_id: 1,
+            thread_id: 2,
+            operator_user_id: 3,
+            control_request_timeout: Duration::from_millis(100),
+        };
+
+        let started = tokio::time::Instant::now();
+        let error = client
+            .call::<serde_json::Value, _>("rate-limited", &serde_json::json!({}))
+            .await
+            .expect_err("429 retry_after should hit total control deadline");
+        let elapsed = started.elapsed();
+
+        server.await.expect("test server task");
+
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "control call exceeded expected deadline window: {elapsed:?}"
+        );
+        assert!(
+            format!("{error:#}").contains("control deadline"),
+            "unexpected timeout error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_supervisor_does_not_serialize_lease_behind_replication() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::sync::Notify;
+
+        let replication_started = Arc::new(Notify::new());
+        let lease_ticks = Arc::new(AtomicUsize::new(0));
+
+        let replication_started_for_replication = replication_started.clone();
+        let replication = async move {
+            replication_started_for_replication.notify_one();
+            std::future::pending::<Result<()>>().await
+        };
+
+        let replication_started_for_lease = replication_started.clone();
+        let lease_ticks_for_lease = lease_ticks.clone();
+        let lease = async move {
+            replication_started_for_lease.notified().await;
+            for _ in 0..3 {
+                lease_ticks_for_lease.fetch_add(1, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+            }
+            Ok(())
+        };
+
+        let admin = std::future::pending::<Result<()>>();
+
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            supervise_ha_runtime(lease, admin, replication),
+        )
+        .await
+        .expect("lease runtime was starved behind blocked replication")
+        .expect("lease runtime failed");
+
+        assert_eq!(lease_ticks.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn runtime_supervisor_keeps_lease_ticking_during_slow_replication() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let lease_ticks = Arc::new(AtomicUsize::new(0));
+        let lease_ticks_for_lease = lease_ticks.clone();
+
+        let lease = async move {
+            loop {
+                lease_ticks_for_lease.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+
+            #[allow(unreachable_code)]
+            Ok(())
+        };
+
+        let admin = std::future::pending::<Result<()>>();
+
+        let replication = async {
+            tokio::time::sleep(Duration::from_millis(220)).await;
+            Ok(())
+        };
+
+        supervise_ha_runtime(lease, admin, replication)
+            .await
+            .expect("HA runtime supervisor failed during injected slow replication");
+
+        let ticks = lease_ticks.load(Ordering::SeqCst);
+        assert!(
+            ticks >= 8,
+            "lease runtime was starved by slow replication: only {ticks} ticks observed"
+        );
+    }
+
+    #[test]
+    fn control_request_timeout_is_bounded_by_renew_cadence() {
+        let mut config = cfg();
+        assert_eq!(control_request_timeout(&config), Duration::from_secs(4));
+
+        config.renew_interval_secs = 2;
+        assert_eq!(control_request_timeout(&config), Duration::from_secs(1));
+
+        config.renew_interval_secs = 30;
+        assert_eq!(control_request_timeout(&config), Duration::from_secs(4));
     }
 
     #[test]
