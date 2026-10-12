@@ -225,7 +225,13 @@ if [ -n "$DEB_FILE_SUFFIX" ]; then
 else
   DEB_FILE="$DIST/reddit2tg_${VERSION}_${ARCH}.deb"
 fi
-dpkg-deb --root-owner-group --build "$DEB_ROOT" "$DEB_FILE" >/dev/null
+if [ "$DEB_FILE_SUFFIX" = "stretch" ]; then
+  # Debian Stretch dpkg 1.18.x cannot unpack zstd-compressed .deb members.
+  # Force the legacy-compatible xz format for both control.tar and data.tar.
+  dpkg-deb -Zxz -z9 --root-owner-group --build "$DEB_ROOT" "$DEB_FILE" >/dev/null
+else
+  dpkg-deb --root-owner-group --build "$DEB_ROOT" "$DEB_FILE" >/dev/null
+fi
 
 printf '%s\n' "$TAR_FILE"
 printf '%s\n' "$DEB_FILE"

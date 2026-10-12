@@ -85,7 +85,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install packaging tools
-        run: sudo apt-get update && sudo apt-get install -y binutils file dpkg-dev
+        run: sudo apt-get update && sudo apt-get install -y binutils file dpkg-dev xz-utils
 
       - name: Install legacy QEMU
         if: matrix.qemu != ''
@@ -129,13 +129,24 @@ jobs:
           DEB_FILE_SUFFIX: ${{ matrix.deb_suffix }}
         run: bash scripts/package-release.sh 'target/${{ matrix.target }}/release/reddit2tg'
 
-      - name: Verify Debian package architecture
+      - name: Verify Debian package
         shell: bash
         run: |
           set -euo pipefail
           deb="$(find dist -maxdepth 1 -type f -name '*.deb' -print -quit)"
           test -n "$deb"
           test "$(dpkg-deb -f "$deb" Architecture)" = "${{ matrix.deb_arch }}"
+          if [ "${{ matrix.deb_suffix }}" = "stretch" ]; then
+            members="$(ar t "$deb")"
+            printf '%s\n' "$members"
+            printf '%s\n' "$members" | grep -qx 'debian-binary'
+            printf '%s\n' "$members" | grep -qx 'control.tar.xz'
+            printf '%s\n' "$members" | grep -qx 'data.tar.xz'
+            if printf '%s\n' "$members" | grep -q '\.zst$'; then
+              echo "Stretch package unexpectedly contains zstd-compressed members" >&2
+              exit 1
+            fi
+          fi
 
       - name: Upload architecture artifacts
         uses: actions/upload-artifact@v4
