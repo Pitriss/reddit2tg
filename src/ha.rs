@@ -28,6 +28,8 @@ const HA_LEGACY_CONTROL_PREFIX: &str = "reddit2tg-ha-v2\n";
 pub const HA_CONTROL_TOPIC_NAME: &str = "ha-control-room";
 pub const HA_SYNC_TOPIC_NAME: &str = "ha-sync";
 const CONTROL_POLL_SECS: u64 = 2;
+const LEASE_RETRY_MAX_SECS: u64 = 2;
+const CONTROL_REQUEST_TIMEOUT_MAX_SECS: u64 = 4;
 const REPLICATION_PAYLOAD_PROTOCOL: u32 = 2;
 const REPLICATION_EPOCH_META: &str = "ha_replication_epoch";
 const REPLICATION_DELTA_CHANGE_LIMIT: usize = 512;
@@ -373,6 +375,7 @@ struct HaTelegramClient {
     chat_id: i64,
     thread_id: i64,
     operator_user_id: i64,
+    control_request_timeout: Duration,
 }
 
 #[derive(Debug, Deserialize)]
@@ -422,7 +425,13 @@ struct HaGetUpdatesBody {
 }
 
 impl HaTelegramClient {
-    fn new(bot_token: &str, chat_id: i64, thread_id: i64, operator_user_id: i64) -> Result<Self> {
+    fn new(
+        bot_token: &str,
+        chat_id: i64,
+        thread_id: i64,
+        operator_user_id: i64,
+        control_request_timeout: Duration,
+    ) -> Result<Self> {
         let http = Client::builder().timeout(Duration::from_secs(30)).build()?;
         let token = bot_token.trim();
         Ok(Self {
@@ -432,6 +441,7 @@ impl HaTelegramClient {
             chat_id,
             thread_id,
             operator_user_id,
+            control_request_timeout,
         })
     }
 
@@ -813,6 +823,7 @@ impl HaTelegramClient {
             let response = self
                 .http
                 .post(&url)
+                .timeout(self.control_request_timeout)
                 .json(body)
                 .send()
                 .await
@@ -886,6 +897,7 @@ impl HaController {
                 telegram_chat_id,
                 cfg.control_thread_id,
                 operator_user_id,
+                control_request_timeout(cfg),
             )?,
             nonce: Arc::new(nonce),
             role: Arc::new(RwLock::new(LocalRole::Standby)),
@@ -911,25 +923,21 @@ impl HaController {
         self.force_local_standby(&reddit).await?;
         self.ensure_document().await?;
 
-        let mut backoff = 1u64;
-        loop {
-            match self.runtime_tick(&reddit, &db).await {
-                Ok(()) => {
-                    backoff = 1;
-                    sleep(Duration::from_secs(CONTROL_POLL_SECS)).await;
-                }
-                Err(error) => {
-                    warn!(
-                        error = %format!("{error:#}"),
-                        backoff_secs = backoff,
-                        instance_id = %self.cfg.instance_id,
-                        "HA control iteration failed"
-                    );
-                    self.fail_closed_if_needed(&reddit).await;
-                    sleep(Duration::from_secs(backoff)).await;
-                    backoff = (backoff * 2).min(10);
-                }
-            }
+        // Lease/election work must never wait behind replication I/O. Alpha3
+        // ran replication_tick() before tick(), so a slow Telegram file upload
+        // could consume the whole lease window and make the active node fence
+        // itself before it got a chance to renew.
+        let lease = self.lease_runtime_loop(&reddit, &db);
+        let admin = self.admin_runtime_loop();
+        let replication = self.replication_runtime_loop(&db);
+        tokio::pin!(lease);
+        tokio::pin!(admin);
+        tokio::pin!(replication);
+
+        tokio::select! {
+            result = &mut lease => result.context("HA lease runtime loop stopped"),
+            result = &mut admin => result.context("HA admin runtime loop stopped"),
+            result = &mut replication => result.context("HA replication runtime loop stopped"),
         }
     }
 
@@ -1045,17 +1053,77 @@ impl HaController {
         }
     }
 
-    async fn runtime_tick(&self, reddit: &RedditClient, db: &Db) -> Result<()> {
-        if let Err(error) = self.control_poller_tick().await {
-            warn!(
-                error = %format!("{error:#}"),
-                instance_id = %self.cfg.instance_id,
-                "HA admin control poller iteration failed"
-            );
+    async fn lease_runtime_loop(&self, reddit: &RedditClient, db: &Db) -> Result<()> {
+        let mut backoff = 1u64;
+        loop {
+            match self.tick(reddit, db).await {
+                Ok(()) => {
+                    backoff = 1;
+                    sleep(Duration::from_secs(CONTROL_POLL_SECS)).await;
+                }
+                Err(error) => {
+                    warn!(
+                        error = %format!("{error:#}"),
+                        backoff_secs = backoff,
+                        instance_id = %self.cfg.instance_id,
+                        "HA lease iteration failed"
+                    );
+                    self.fail_closed_if_needed(reddit).await;
+                    sleep(Duration::from_secs(backoff)).await;
+                    backoff = (backoff * 2).min(LEASE_RETRY_MAX_SECS);
+                }
+            }
         }
-        self.ensure_sync_topic().await?;
-        self.replication_tick(db).await?;
-        self.tick(reddit, db).await
+    }
+
+    async fn admin_runtime_loop(&self) -> Result<()> {
+        let mut backoff = 1u64;
+        loop {
+            match self.control_poller_tick().await {
+                Ok(()) => {
+                    backoff = 1;
+                    sleep(Duration::from_secs(CONTROL_POLL_SECS)).await;
+                }
+                Err(error) => {
+                    warn!(
+                        error = %format!("{error:#}"),
+                        backoff_secs = backoff,
+                        instance_id = %self.cfg.instance_id,
+                        "HA admin control poller iteration failed"
+                    );
+                    sleep(Duration::from_secs(backoff)).await;
+                    backoff = (backoff * 2).min(10);
+                }
+            }
+        }
+    }
+
+    async fn replication_runtime_loop(&self, db: &Db) -> Result<()> {
+        let mut backoff = 1u64;
+        loop {
+            let iteration = async {
+                self.ensure_sync_topic().await?;
+                self.replication_tick(db).await
+            }
+            .await;
+
+            match iteration {
+                Ok(()) => {
+                    backoff = 1;
+                    sleep(Duration::from_secs(CONTROL_POLL_SECS)).await;
+                }
+                Err(error) => {
+                    warn!(
+                        error = %format!("{error:#}"),
+                        backoff_secs = backoff,
+                        instance_id = %self.cfg.instance_id,
+                        "HA replication iteration failed"
+                    );
+                    sleep(Duration::from_secs(backoff)).await;
+                    backoff = (backoff * 2).min(10);
+                }
+            }
+        }
     }
 
     async fn control_poller_tick(&self) -> Result<()> {
@@ -3503,6 +3571,13 @@ impl HaController {
     }
 }
 
+fn control_request_timeout(cfg: &HaConfig) -> Duration {
+    let renew_ms = cfg.renew_interval_secs.saturating_mul(1000);
+    let timeout_ms = (renew_ms / 2)
+        .clamp(1_000, CONTROL_REQUEST_TIMEOUT_MAX_SECS.saturating_mul(1000));
+    Duration::from_millis(timeout_ms)
+}
+
 pub fn validate_config(cfg: &HaConfig) -> Result<()> {
     if !cfg.enabled {
         return Ok(());
@@ -4075,6 +4150,18 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn control_request_timeout_is_bounded_by_renew_cadence() {
+        let mut config = cfg();
+        assert_eq!(control_request_timeout(&config), Duration::from_secs(4));
+
+        config.renew_interval_secs = 2;
+        assert_eq!(control_request_timeout(&config), Duration::from_secs(1));
+
+        config.renew_interval_secs = 30;
+        assert_eq!(control_request_timeout(&config), Duration::from_secs(4));
     }
 
     #[test]
