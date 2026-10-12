@@ -3,6 +3,7 @@ mod config;
 mod db;
 pub mod ha;
 mod reddit;
+mod replication;
 mod telegram;
 
 use std::{path::PathBuf, time::Duration};

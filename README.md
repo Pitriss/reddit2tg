@@ -1071,3 +1071,36 @@ recovery without sharing SQLite over NFS.
 
 Protocol 3 nodes must not be mixed with protocol 2 (`v0.4.0-alpha1`) nodes in
 one running cluster.
+
+<!-- ha-v3-sync-transport -->
+### HA replication transport: `ha-sync`
+
+HA protocol 3 keeps human administration and replication traffic separate.
+
+The shared HA bot uses two reserved topics in the same Telegram forum:
+
+- `ha-control-room` — operator commands and the pinned canonical HA state.
+- `ha-sync` — encrypted replication delta/snapshot files only.
+
+`ha-control-room` is created/configured by the operator as before. The HA bot
+must now have both **Pin Messages** and **Manage Topics** administrator
+permissions. The first protocol-3 control owner creates `ha-sync`
+automatically and stores its `message_thread_id` in the canonical HA document;
+there is no additional thread ID in `config.toml`.
+
+Replication payloads are gzip-compressed and authenticated/encrypted with
+ChaCha20-Poly1305. The per-cluster key is derived from the shared HA bot token
+and `cluster_id`; the token itself is never stored in SQLite or Telegram.
+Snapshot payloads are split according to `replication_snapshot_chunk_mib`
+(default 8 MiB), safely below the official Bot API `getFile` download limit.
+
+A standby node must apply the canonical snapshot/delta chain until its local
+replication generation exactly matches the cluster generation before it is
+eligible to claim the Reddit lease. Local Matrix authentication tokens are
+never included in replicated state.
+
+When upgrading from `v0.4.0-alpha1`/HA protocol 2, stop every alpha1 node first
+and wait for its Reddit/control leases to expire. Protocol 3 can then migrate
+the pinned protocol-2 document in place, preserving the shared Telegram data
+and control update offsets before creating `ha-sync` and publishing the initial
+logical database snapshot.

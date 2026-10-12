@@ -15,7 +15,7 @@ use tracing::{error, info, warn};
 use crate::{
     config::Config,
     db::{Db, MessageSnapshot, RoomMap, TelegramDelivery},
-    ha::{HaController, HA_CONTROL_TOPIC_NAME},
+    ha::{HaController, HA_CONTROL_TOPIC_NAME, HA_SYNC_TOPIC_NAME},
     reddit::{
         detect_supported_image_mime, is_auth_refresh_error, matrix_localpart, member_display_name,
         reddit_upload_limit, InvitedRoom, JoinedRoom, MatrixEvent, RedditClient, SendImageRequest,
@@ -1083,7 +1083,25 @@ impl Bridge {
             .ha
             .as_ref()
             .context("HA loop requested without HA controller")?;
-        ha.run(self.reddit.clone()).await
+        ha.run(self.reddit.clone(), self.db.clone()).await
+    }
+
+    async fn flush_ha_replication(&self) -> Result<()> {
+        if let Some(ha) = &self.ha {
+            ha.flush_replication(&self.db).await?;
+        }
+        Ok(())
+    }
+
+    async fn acknowledge_telegram_update(&self, update_id: i64) -> Result<()> {
+        let offset = update_id.saturating_add(1);
+        if let Some(ha) = &self.ha {
+            ha.flush_replication(&self.db).await?;
+            ha.commit_data_update_offset(offset).await?;
+        } else {
+            self.db.set_meta("telegram_offset", &offset.to_string())?;
+        }
+        Ok(())
     }
 
     async fn matrix_loop(&self) -> Result<()> {
@@ -1175,13 +1193,16 @@ impl Bridge {
                 self.process_invite(&room_id, room)
                     .await
                     .with_context(|| format!("initial invite room {room_id}"))?;
+                self.flush_ha_replication().await?;
             }
             for (room_id, room) in sync.rooms.join {
                 self.process_initial_joined_room(&room_id, room)
                     .await
                     .with_context(|| format!("initial joined room {room_id}"))?;
+                self.flush_ha_replication().await?;
             }
             self.db.set_meta("matrix_next_batch", &sync.next_batch)?;
+            self.flush_ha_replication().await?;
             info!(
                 startup_ms = self.startup_ms,
                 "initial Matrix checkpoint established; only joined-room events created after bridge startup were forwarded"
@@ -1193,15 +1214,18 @@ impl Bridge {
             self.process_invite(&room_id, room)
                 .await
                 .with_context(|| format!("invite room {room_id}"))?;
+            self.flush_ha_replication().await?;
         }
         for (room_id, room) in sync.rooms.join {
             if let Err(err) = self.process_joined_room(&room_id, room).await {
                 return Err(err).with_context(|| format!("room {room_id}"));
             }
+            self.flush_ha_replication().await?;
         }
 
         self.db.set_meta("matrix_next_batch", &sync.next_batch)?;
         let _ = self.db.prune_seen_events(30 * 24 * 3600);
+        self.flush_ha_replication().await?;
         Ok(())
     }
 
@@ -2146,12 +2170,13 @@ impl Bridge {
         for update in updates {
             next_offset = next_offset.max(update.update_id + 1);
             if let Some(message) = update.message.as_ref() {
-                let reserved_control_thread = self
-                    .ha
-                    .as_ref()
-                    .is_some_and(|ha| ha.is_control_thread(message.message_thread_id));
+                let reserved_ha_thread = if let Some(ha) = &self.ha {
+                    ha.is_reserved_thread(message.message_thread_id).await
+                } else {
+                    false
+                };
 
-                if reserved_control_thread {
+                if reserved_ha_thread {
                     info!(
                         update_id = update.update_id,
                         message_id = message.message_id,
@@ -2173,6 +2198,7 @@ impl Bridge {
             }
 
             if let Some(ha) = &self.ha {
+                ha.flush_replication(&self.db).await?;
                 ha.commit_data_update_offset(next_offset).await?;
             } else {
                 self.db
@@ -2424,8 +2450,7 @@ impl Bridge {
             }
 
             let acknowledged_offset = update_id.saturating_add(1);
-            self.db
-                .set_meta("telegram_offset", &acknowledged_offset.to_string())?;
+            self.acknowledge_telegram_update(update_id).await?;
             info!(
                 update_id,
                 telegram_offset = acknowledged_offset,
@@ -2597,8 +2622,7 @@ impl Bridge {
             // If replay fails, the operator can issue the command again, but a
             // transient Telegram error must never create a new topic repeatedly.
             let acknowledged_offset = update_id.saturating_add(1);
-            self.db
-                .set_meta("telegram_offset", &acknowledged_offset.to_string())?;
+            self.acknowledge_telegram_update(update_id).await?;
             info!(
                 update_id,
                 telegram_offset = acknowledged_offset,
@@ -3091,7 +3115,9 @@ fn clean_name(value: &str) -> String {
     let v = value.trim();
     let base = if v.is_empty() { "Reddit chat" } else { v };
     let cleaned: String = base.chars().take(110).collect();
-    if cleaned.eq_ignore_ascii_case(HA_CONTROL_TOPIC_NAME) {
+    if cleaned.eq_ignore_ascii_case(HA_CONTROL_TOPIC_NAME)
+        || cleaned.eq_ignore_ascii_case(HA_SYNC_TOPIC_NAME)
+    {
         format!("Reddit · {cleaned}")
     } else {
         cleaned
@@ -3265,6 +3291,8 @@ mod tests {
     fn reserved_ha_control_topic_name_is_not_used_for_reddit_chat() {
         assert_eq!(clean_name("ha-control-room"), "Reddit · ha-control-room");
         assert_eq!(clean_name("HA-CONTROL-ROOM"), "Reddit · HA-CONTROL-ROOM");
+        assert_eq!(clean_name("ha-sync"), "Reddit · ha-sync");
+        assert_eq!(clean_name("HA-SYNC"), "Reddit · HA-SYNC");
         assert_eq!(clean_name("normal-user"), "normal-user");
     }
 

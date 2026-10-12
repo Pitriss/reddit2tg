@@ -17,13 +17,22 @@ use tracing::{info, warn};
 
 use crate::{
     config::{HaConfig, HaInstanceConfig},
+    db::{Db, ReplicationChange, ReplicationSnapshot},
     reddit::RedditClient,
+    replication::{derive_key, open_json, random_epoch, seal_json, sha256_hex, split_chunks},
 };
 
 pub const HA_PROTOCOL_VERSION: u32 = 3;
 pub const HA_CONTROL_PREFIX: &str = "reddit2tg-ha-v3\n";
+const HA_LEGACY_CONTROL_PREFIX: &str = "reddit2tg-ha-v2\n";
 pub const HA_CONTROL_TOPIC_NAME: &str = "ha-control-room";
+pub const HA_SYNC_TOPIC_NAME: &str = "ha-sync";
 const CONTROL_POLL_SECS: u64 = 2;
+const REPLICATION_PAYLOAD_PROTOCOL: u32 = 1;
+const REPLICATION_EPOCH_META: &str = "ha_replication_epoch";
+const REPLICATION_DELTA_CHANGE_LIMIT: usize = 512;
+const REPLICATION_MAX_CHAIN: usize = 10_000;
+const TELEGRAM_FILE_DOWNLOAD_LIMIT: usize = 20 * 1024 * 1024;
 const CONTROL_CLAIM_STAGGER_MS: i64 = 1_000;
 const CONTROL_WRITE_RETRIES: usize = 8;
 const MAX_CONTROL_RATE_LIMIT_RETRIES: usize = 5;
@@ -96,6 +105,40 @@ pub struct ReplicationFilePart {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ReplicationDelta {
+    protocol: u32,
+    cluster_id: String,
+    epoch: String,
+    generation: u64,
+    previous_generation: u64,
+    previous_file_id: Option<String>,
+    previous_sha256: Option<String>,
+    source_instance: String,
+    changes: Vec<ReplicationChange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ReplicationSnapshotEnvelope {
+    protocol: u32,
+    cluster_id: String,
+    epoch: String,
+    generation: u64,
+    source_instance: String,
+    snapshot: ReplicationSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ReplicationSnapshotManifest {
+    protocol: u32,
+    cluster_id: String,
+    epoch: String,
+    generation: u64,
+    state_sha256: String,
+    payload_sha256: String,
+    parts: Vec<ReplicationFilePart>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HaDocument {
     pub protocol: u32,
     pub cluster_id: String,
@@ -131,6 +174,10 @@ pub struct HaDocument {
     #[serde(default)]
     pub data_update_offset: i64,
     #[serde(default)]
+    pub sync_thread_id: Option<i64>,
+    #[serde(default)]
+    pub replication_epoch: Option<String>,
+    #[serde(default)]
     pub replication_generation: u64,
     #[serde(default)]
     pub replication_head_file_id: Option<String>,
@@ -139,7 +186,11 @@ pub struct HaDocument {
     #[serde(default)]
     pub replication_snapshot_generation: u64,
     #[serde(default)]
-    pub replication_snapshot_parts: Vec<ReplicationFilePart>,
+    pub replication_snapshot_state_sha256: Option<String>,
+    #[serde(default)]
+    pub replication_snapshot_manifest_file_id: Option<String>,
+    #[serde(default)]
+    pub replication_snapshot_manifest_sha256: Option<String>,
 }
 
 impl HaDocument {
@@ -172,11 +223,15 @@ impl HaDocument {
             control_lease_expires_at_ms: now_ms,
             control_update_offset: 0,
             data_update_offset: 0,
+            sync_thread_id: None,
+            replication_epoch: None,
             replication_generation: 0,
             replication_head_file_id: None,
             replication_head_sha256: None,
             replication_snapshot_generation: 0,
-            replication_snapshot_parts: Vec::new(),
+            replication_snapshot_state_sha256: None,
+            replication_snapshot_manifest_file_id: None,
+            replication_snapshot_manifest_sha256: None,
         }
     }
 
@@ -258,7 +313,11 @@ pub struct HaController {
     lease_expires_at_ms: Arc<Mutex<i64>>,
     claim_cooldown_until_ms: Arc<Mutex<i64>>,
     state_message_id: Arc<Mutex<Option<i64>>>,
+    sync_thread_id_cache: Arc<Mutex<Option<i64>>>,
     document_write_lock: Arc<Mutex<()>>,
+    replication_lock: Arc<Mutex<()>>,
+    last_replication_flush_ms: Arc<Mutex<i64>>,
+    replication_key: Arc<[u8; 32]>,
 }
 
 #[derive(Debug, Clone)]
@@ -267,10 +326,18 @@ struct PinnedDocument {
     document: HaDocument,
 }
 
+#[derive(Debug, Clone)]
+struct SnapshotUpload {
+    state_sha256: String,
+    manifest_file_id: String,
+    manifest_sha256: String,
+}
+
 #[derive(Clone)]
 struct HaTelegramClient {
     http: Client,
     base: String,
+    file_base: String,
     chat_id: i64,
     thread_id: i64,
     operator_user_id: i64,
@@ -325,9 +392,11 @@ struct HaGetUpdatesBody {
 impl HaTelegramClient {
     fn new(bot_token: &str, chat_id: i64, thread_id: i64, operator_user_id: i64) -> Result<Self> {
         let http = Client::builder().timeout(Duration::from_secs(30)).build()?;
+        let token = bot_token.trim();
         Ok(Self {
             http,
-            base: format!("https://api.telegram.org/bot{}", bot_token.trim()),
+            base: format!("https://api.telegram.org/bot{token}"),
+            file_base: format!("https://api.telegram.org/file/bot{token}"),
             chat_id,
             thread_id,
             operator_user_id,
@@ -376,10 +445,129 @@ impl HaTelegramClient {
             .get("can_pin_messages")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        if status != "creator" && !(status == "administrator" && can_pin_messages) {
-            bail!("HA control bot must be an administrator with permission to pin messages");
+        let can_manage_topics = member
+            .get("can_manage_topics")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if status != "creator"
+            && !(status == "administrator" && can_pin_messages && can_manage_topics)
+        {
+            bail!(
+                "HA bot must be an administrator with Pin Messages and Manage Topics permissions"
+            );
         }
         Ok(())
+    }
+
+    async fn create_sync_topic(&self) -> Result<i64> {
+        let topic: Value = self
+            .call(
+                "createForumTopic",
+                &serde_json::json!({
+                    "chat_id": self.chat_id,
+                    "name": HA_SYNC_TOPIC_NAME,
+                }),
+            )
+            .await?;
+        topic
+            .get("message_thread_id")
+            .and_then(Value::as_i64)
+            .context("HA createForumTopic response has no message_thread_id")
+    }
+
+    async fn send_replication_file(
+        &self,
+        thread_id: i64,
+        file_name: &str,
+        caption: &str,
+        data: &[u8],
+    ) -> Result<String> {
+        let url = format!("{}/sendDocument", self.base);
+
+        for retry in 0..=MAX_CONTROL_RATE_LIMIT_RETRIES {
+            let part = reqwest::multipart::Part::bytes(data.to_vec())
+                .file_name(file_name.to_owned())
+                .mime_str("application/octet-stream")?;
+            let form = reqwest::multipart::Form::new()
+                .text("chat_id", self.chat_id.to_string())
+                .text("message_thread_id", thread_id.to_string())
+                .text("caption", caption.to_owned())
+                .text("disable_notification", "true")
+                .part("document", part);
+
+            let response = self
+                .http
+                .post(&url)
+                .multipart(form)
+                .send()
+                .await
+                .context("HA Telegram sendDocument request failed")?;
+            let status = response.status();
+            let parsed: ApiResponse<Value> = response.json().await.with_context(|| {
+                format!("HA Telegram sendDocument returned invalid JSON (HTTP {status})")
+            })?;
+
+            if parsed.ok {
+                let message = parsed
+                    .result
+                    .context("HA Telegram sendDocument returned ok without result")?;
+                return message
+                    .get("document")
+                    .and_then(|document| document.get("file_id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .context("HA Telegram sendDocument response has no document.file_id");
+            }
+
+            if let Some(retry_after) = parsed
+                .parameters
+                .as_ref()
+                .and_then(|parameters| parameters.retry_after)
+            {
+                if retry < MAX_CONTROL_RATE_LIMIT_RETRIES {
+                    sleep(Duration::from_secs(retry_after.saturating_add(1))).await;
+                    continue;
+                }
+            }
+
+            bail!(
+                "HA Telegram sendDocument failed (HTTP {status}): {}",
+                parsed
+                    .description
+                    .unwrap_or_else(|| "unknown error".to_owned())
+            );
+        }
+
+        unreachable!()
+    }
+
+    async fn download_replication_file(&self, file_id: &str) -> Result<Vec<u8>> {
+        let file: Value = self
+            .call("getFile", &serde_json::json!({"file_id": file_id}))
+            .await?;
+        let file_path = file
+            .get("file_path")
+            .and_then(Value::as_str)
+            .context("HA Telegram getFile response has no file_path")?;
+        let response = self
+            .http
+            .get(format!("{}/{}", self.file_base, file_path))
+            .send()
+            .await
+            .context("HA Telegram replication file download failed")?
+            .error_for_status()
+            .context("HA Telegram replication file download returned HTTP error")?;
+        let bytes = response
+            .bytes()
+            .await
+            .context("HA Telegram replication file body could not be read")?;
+        if bytes.len() > TELEGRAM_FILE_DOWNLOAD_LIMIT {
+            bail!(
+                "HA replication file exceeds Telegram Bot API download safety limit: {} bytes",
+                bytes.len()
+            );
+        }
+        Ok(bytes.to_vec())
     }
 
     async fn read_pinned(&self) -> Result<Option<PinnedDocument>> {
@@ -609,7 +797,11 @@ impl HaController {
             lease_expires_at_ms: Arc::new(Mutex::new(0)),
             claim_cooldown_until_ms: Arc::new(Mutex::new(0)),
             state_message_id: Arc::new(Mutex::new(None)),
+            sync_thread_id_cache: Arc::new(Mutex::new(None)),
             document_write_lock: Arc::new(Mutex::new(())),
+            replication_lock: Arc::new(Mutex::new(())),
+            last_replication_flush_ms: Arc::new(Mutex::new(0)),
+            replication_key: Arc::new(derive_key(&cfg.control_bot_token, &cfg.cluster_id)),
         }))
     }
 
@@ -620,13 +812,13 @@ impl HaController {
         Ok(())
     }
 
-    pub async fn run(&self, reddit: RedditClient) -> Result<()> {
+    pub async fn run(&self, reddit: RedditClient, db: Db) -> Result<()> {
         self.force_local_standby(&reddit).await?;
         self.ensure_document().await?;
 
         let mut backoff = 1u64;
         loop {
-            match self.runtime_tick(&reddit).await {
+            match self.runtime_tick(&reddit, &db).await {
                 Ok(()) => {
                     backoff = 1;
                     sleep(Duration::from_secs(CONTROL_POLL_SECS)).await;
@@ -758,7 +950,7 @@ impl HaController {
         }
     }
 
-    async fn runtime_tick(&self, reddit: &RedditClient) -> Result<()> {
+    async fn runtime_tick(&self, reddit: &RedditClient, db: &Db) -> Result<()> {
         if let Err(error) = self.control_poller_tick().await {
             warn!(
                 error = %format!("{error:#}"),
@@ -766,7 +958,9 @@ impl HaController {
                 "HA admin control poller iteration failed"
             );
         }
-        self.tick(reddit).await
+        self.ensure_sync_topic().await?;
+        self.replication_tick(db).await?;
+        self.tick(reddit, db).await
     }
 
     async fn control_poller_tick(&self) -> Result<()> {
@@ -923,8 +1117,61 @@ impl HaController {
         Ok(())
     }
 
-    pub fn is_control_thread(&self, message_thread_id: Option<i64>) -> bool {
-        message_thread_id == Some(self.cfg.control_thread_id)
+    pub async fn is_reserved_thread(&self, message_thread_id: Option<i64>) -> bool {
+        if message_thread_id == Some(self.cfg.control_thread_id) {
+            return true;
+        }
+        let sync_thread_id = *self.sync_thread_id_cache.lock().await;
+        message_thread_id.is_some() && message_thread_id == sync_thread_id
+    }
+
+    async fn ensure_sync_topic(&self) -> Result<Option<i64>> {
+        let document = self.read_document().await?.document;
+        if let Some(thread_id) = document.sync_thread_id {
+            *self.sync_thread_id_cache.lock().await = Some(thread_id);
+            return Ok(Some(thread_id));
+        }
+
+        if !self.control_owned_by_this_process(&document)
+            || !document.control_owner_is_live(now_ms())
+        {
+            return Ok(None);
+        }
+
+        let created_thread_id = self.api.create_sync_topic().await?;
+        let instance_id = self.cfg.instance_id.clone();
+        let nonce = self.nonce.to_string();
+        let updated = self
+            .update_document(|current| {
+                if current.sync_thread_id.is_some() {
+                    return Ok(());
+                }
+                if current.control_owner.as_deref() != Some(instance_id.as_str())
+                    || current.control_owner_nonce.as_deref() != Some(nonce.as_str())
+                    || !current.control_owner_is_live(now_ms())
+                {
+                    bail!("HA control ownership changed while creating ha-sync");
+                }
+                current.sync_thread_id = Some(created_thread_id);
+                Ok(())
+            })
+            .await?;
+
+        *self.sync_thread_id_cache.lock().await = updated.sync_thread_id;
+        if updated.sync_thread_id == Some(created_thread_id) {
+            info!(
+                instance_id = %self.cfg.instance_id,
+                telegram_thread_id = created_thread_id,
+                "HA replication topic created"
+            );
+        } else {
+            warn!(
+                created_thread_id,
+                canonical_thread_id = ?updated.sync_thread_id,
+                "HA sync topic was created concurrently; unused topic may remain"
+            );
+        }
+        Ok(updated.sync_thread_id)
     }
 
     fn control_owned_by_this_process(&self, document: &HaDocument) -> bool {
@@ -932,7 +1179,585 @@ impl HaController {
             && document.control_owner_nonce.as_deref() == Some(self.nonce.as_str())
     }
 
-    async fn tick(&self, reddit: &RedditClient) -> Result<()> {
+    pub async fn flush_replication(&self, db: &Db) -> Result<()> {
+        let _guard = self.replication_lock.lock().await;
+        self.publish_pending_replication_locked(db).await?;
+        *self.last_replication_flush_ms.lock().await = now_ms();
+        Ok(())
+    }
+
+    async fn replication_tick(&self, db: &Db) -> Result<()> {
+        let _guard = self.replication_lock.lock().await;
+        let mut document = self.read_document().await?.document;
+
+        if document.sync_thread_id.is_none() {
+            return Ok(());
+        }
+
+        if document.replication_epoch.is_none() {
+            self.bootstrap_replication_locked(db, &document).await?;
+            document = self.read_document().await?.document;
+            if document.replication_epoch.is_none() {
+                return Ok(());
+            }
+        }
+
+        let owned_active =
+            self.owned_by_this_process(&document) && document.owner_is_live(now_ms());
+        if owned_active {
+            let now = now_ms();
+            let last = *self.last_replication_flush_ms.lock().await;
+            if now.saturating_sub(last) >= self.cfg.replication_batch_ms.min(i64::MAX as u64) as i64
+            {
+                self.publish_pending_replication_locked(db).await?;
+                *self.last_replication_flush_ms.lock().await = now;
+            }
+            self.maybe_publish_snapshot_locked(db).await?;
+        } else {
+            self.catch_up_replication_locked(db, &document).await?;
+        }
+        Ok(())
+    }
+
+    fn replication_ready(&self, db: &Db, document: &HaDocument) -> Result<bool> {
+        let Some(epoch) = document.replication_epoch.as_deref() else {
+            return Ok(false);
+        };
+        if document.sync_thread_id.is_none()
+            || document.replication_snapshot_manifest_file_id.is_none()
+            || document.replication_snapshot_manifest_sha256.is_none()
+            || document.replication_snapshot_state_sha256.is_none()
+        {
+            return Ok(false);
+        }
+        if db.get_meta(REPLICATION_EPOCH_META)?.as_deref() != Some(epoch) {
+            return Ok(false);
+        }
+        if db.replication_generation()? != document.replication_generation {
+            return Ok(false);
+        }
+        if !db.pending_replication_changes(1)?.is_empty() {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    async fn bootstrap_replication_locked(&self, db: &Db, observed: &HaDocument) -> Result<()> {
+        if observed.replication_epoch.is_some()
+            || observed.owner_is_live(now_ms())
+            || observed.claim_is_live(now_ms())
+        {
+            return Ok(());
+        }
+        let Some(thread_id) = observed.sync_thread_id else {
+            return Ok(());
+        };
+        if claim_rank(&self.cfg, observed, now_ms(), &self.cfg.instance_id) != Some(0) {
+            return Ok(());
+        }
+
+        let snapshot = db.export_replication_snapshot()?;
+        let epoch = random_epoch()?;
+        let upload = self.upload_snapshot(thread_id, &epoch, &snapshot).await?;
+        let local_telegram_offset = db
+            .get_meta("telegram_offset")?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+
+        let updated = self
+            .update_document(|document| {
+                if document.replication_epoch.is_some()
+                    || document.owner_is_live(now_ms())
+                    || document.claim_is_live(now_ms())
+                {
+                    return Ok(());
+                }
+                if document.sync_thread_id != Some(thread_id) {
+                    bail!("ha-sync topic changed during replication bootstrap");
+                }
+                if claim_rank(&self.cfg, document, now_ms(), &self.cfg.instance_id) != Some(0) {
+                    return Ok(());
+                }
+
+                document.replication_epoch = Some(epoch.clone());
+                document.replication_generation = snapshot.generation;
+                document.replication_head_file_id = None;
+                document.replication_head_sha256 = None;
+                document.replication_snapshot_generation = snapshot.generation;
+                document.replication_snapshot_state_sha256 = Some(upload.state_sha256.clone());
+                document.replication_snapshot_manifest_file_id =
+                    Some(upload.manifest_file_id.clone());
+                document.replication_snapshot_manifest_sha256 =
+                    Some(upload.manifest_sha256.clone());
+                document.data_update_offset =
+                    document.data_update_offset.max(local_telegram_offset);
+                Ok(())
+            })
+            .await?;
+
+        if updated.replication_epoch.as_deref() == Some(epoch.as_str()) {
+            db.set_meta(REPLICATION_EPOCH_META, &epoch)?;
+            info!(
+                instance_id = %self.cfg.instance_id,
+                replication_generation = snapshot.generation,
+                data_update_offset = updated.data_update_offset,
+                telegram_thread_id = thread_id,
+                "HA replication baseline snapshot published"
+            );
+        }
+        Ok(())
+    }
+
+    async fn publish_pending_replication_locked(&self, db: &Db) -> Result<()> {
+        let document = self.read_document().await?.document;
+        let now = now_ms();
+        if !self.owned_by_this_process(&document) || !document.owner_is_live(now) {
+            return Ok(());
+        }
+
+        let epoch = document
+            .replication_epoch
+            .as_deref()
+            .context("active HA owner has no replication epoch")?;
+        let thread_id = document
+            .sync_thread_id
+            .context("active HA owner has no ha-sync topic")?;
+        if db.get_meta(REPLICATION_EPOCH_META)?.as_deref() != Some(epoch) {
+            bail!("active HA node has a different replication epoch than the cluster");
+        }
+        let local_generation = db.replication_generation()?;
+        if local_generation != document.replication_generation {
+            bail!(
+                "active HA node replication generation is stale: local={}, cluster={}",
+                local_generation,
+                document.replication_generation
+            );
+        }
+
+        let mut changes = db.pending_replication_changes(REPLICATION_DELTA_CHANGE_LIMIT)?;
+        if changes.is_empty() {
+            return Ok(());
+        }
+
+        let max_payload = (self.cfg.replication_snapshot_chunk_mib as usize) * 1024 * 1024;
+        let (sealed, delta) = loop {
+            let candidate = ReplicationDelta {
+                protocol: REPLICATION_PAYLOAD_PROTOCOL,
+                cluster_id: self.cfg.cluster_id.clone(),
+                epoch: epoch.to_owned(),
+                generation: document.replication_generation.saturating_add(1),
+                previous_generation: document.replication_generation,
+                previous_file_id: document.replication_head_file_id.clone(),
+                previous_sha256: document.replication_head_sha256.clone(),
+                source_instance: self.cfg.instance_id.clone(),
+                changes: changes.clone(),
+            };
+            let aad = format!("delta:{}:{}", self.cfg.cluster_id, epoch);
+            let (candidate_sealed, _) = seal_json(&candidate, &self.replication_key, &aad)?;
+            if candidate_sealed.len() <= max_payload {
+                break (candidate_sealed, candidate);
+            }
+            if changes.len() <= 1 {
+                bail!(
+                    "single HA replication change exceeds configured {} MiB payload limit",
+                    self.cfg.replication_snapshot_chunk_mib
+                );
+            }
+            changes.truncate(changes.len().div_ceil(2));
+        };
+
+        let sealed_sha256 = sha256_hex(&sealed);
+        let file_name = format!("reddit2tg-ha-delta-{:020}.bin", delta.generation);
+        let caption = format!(
+            "reddit2tg HA delta · generation {} · source {}",
+            delta.generation, self.cfg.instance_id
+        );
+        let file_id = self
+            .api
+            .send_replication_file(thread_id, &file_name, &caption, &sealed)
+            .await?;
+
+        let instance_id = self.cfg.instance_id.clone();
+        let nonce = self.nonce.to_string();
+        let expected_epoch = epoch.to_owned();
+        let expected_previous_generation = document.replication_generation;
+        let committed = self
+            .update_document(|current| {
+                if current.owner.as_deref() != Some(instance_id.as_str())
+                    || current.owner_nonce.as_deref() != Some(nonce.as_str())
+                    || !current.owner_is_live(now_ms())
+                {
+                    bail!("HA ownership changed before replication delta commit");
+                }
+                if current.replication_epoch.as_deref() != Some(expected_epoch.as_str())
+                    || current.replication_generation != expected_previous_generation
+                {
+                    bail!("HA replication head changed before delta commit");
+                }
+                current.replication_generation = delta.generation;
+                current.replication_head_file_id = Some(file_id.clone());
+                current.replication_head_sha256 = Some(sealed_sha256.clone());
+                Ok(())
+            })
+            .await?;
+
+        if committed.replication_generation != delta.generation
+            || committed.replication_head_file_id.as_deref() != Some(file_id.as_str())
+        {
+            bail!("HA replication delta upload was not committed as canonical head");
+        }
+
+        let through_seq = changes
+            .last()
+            .context("HA replication delta has no last change")?
+            .seq;
+        db.mark_replication_published(through_seq, delta.generation)?;
+        info!(
+            instance_id = %self.cfg.instance_id,
+            replication_generation = delta.generation,
+            changes = changes.len(),
+            "HA replication delta published"
+        );
+        Ok(())
+    }
+
+    async fn maybe_publish_snapshot_locked(&self, db: &Db) -> Result<()> {
+        let document = self.read_document().await?.document;
+        if !self.owned_by_this_process(&document) || !document.owner_is_live(now_ms()) {
+            return Ok(());
+        }
+        if document
+            .replication_generation
+            .saturating_sub(document.replication_snapshot_generation)
+            < self.cfg.replication_snapshot_every
+        {
+            return Ok(());
+        }
+        if db.replication_generation()? != document.replication_generation {
+            return Ok(());
+        }
+        if !db.pending_replication_changes(1)?.is_empty() {
+            return Ok(());
+        }
+
+        let epoch = document
+            .replication_epoch
+            .as_deref()
+            .context("HA replication snapshot has no epoch")?;
+        let thread_id = document
+            .sync_thread_id
+            .context("HA replication snapshot has no ha-sync topic")?;
+        let snapshot = db.export_replication_snapshot()?;
+        let upload = self.upload_snapshot(thread_id, epoch, &snapshot).await?;
+
+        let instance_id = self.cfg.instance_id.clone();
+        let nonce = self.nonce.to_string();
+        let expected_epoch = epoch.to_owned();
+        self.update_document(|current| {
+            if current.owner.as_deref() != Some(instance_id.as_str())
+                || current.owner_nonce.as_deref() != Some(nonce.as_str())
+                || !current.owner_is_live(now_ms())
+            {
+                return Ok(());
+            }
+            if current.replication_epoch.as_deref() != Some(expected_epoch.as_str())
+                || current.replication_generation != snapshot.generation
+            {
+                return Ok(());
+            }
+            current.replication_snapshot_generation = snapshot.generation;
+            current.replication_snapshot_state_sha256 = Some(upload.state_sha256.clone());
+            current.replication_snapshot_manifest_file_id = Some(upload.manifest_file_id.clone());
+            current.replication_snapshot_manifest_sha256 = Some(upload.manifest_sha256.clone());
+            Ok(())
+        })
+        .await?;
+
+        info!(
+            instance_id = %self.cfg.instance_id,
+            replication_generation = snapshot.generation,
+            "HA replication checkpoint snapshot published"
+        );
+        Ok(())
+    }
+
+    async fn catch_up_replication_locked(&self, db: &Db, document: &HaDocument) -> Result<()> {
+        let epoch = document
+            .replication_epoch
+            .as_deref()
+            .context("HA replication epoch is not initialized")?;
+        if document.sync_thread_id.is_none() {
+            bail!("HA replication epoch exists but ha-sync topic is missing");
+        }
+
+        let local_epoch = db.get_meta(REPLICATION_EPOCH_META)?;
+        let pending_local_changes = !db.pending_replication_changes(1)?.is_empty();
+        let mut local_generation = db.replication_generation()?;
+
+        let must_restore_snapshot = local_epoch.as_deref() != Some(epoch)
+            || pending_local_changes
+            || local_generation > document.replication_generation
+            || local_generation < document.replication_snapshot_generation;
+
+        if must_restore_snapshot {
+            self.apply_snapshot_from_document(db, document).await?;
+            local_generation = db.replication_generation()?;
+        }
+
+        if local_generation < document.replication_generation {
+            self.apply_delta_chain(db, document, local_generation)
+                .await?;
+            local_generation = db.replication_generation()?;
+        }
+
+        if local_generation != document.replication_generation {
+            bail!(
+                "HA replication catch-up incomplete: local={}, cluster={}",
+                local_generation,
+                document.replication_generation
+            );
+        }
+        Ok(())
+    }
+
+    async fn apply_snapshot_from_document(&self, db: &Db, document: &HaDocument) -> Result<()> {
+        let epoch = document
+            .replication_epoch
+            .as_deref()
+            .context("HA snapshot has no replication epoch")?;
+        let manifest_file_id = document
+            .replication_snapshot_manifest_file_id
+            .as_deref()
+            .context("HA snapshot manifest file_id is missing")?;
+        let manifest_sha256 = document
+            .replication_snapshot_manifest_sha256
+            .as_deref()
+            .context("HA snapshot manifest SHA256 is missing")?;
+        let expected_state_sha256 = document
+            .replication_snapshot_state_sha256
+            .as_deref()
+            .context("HA snapshot state SHA256 is missing")?;
+
+        let manifest_bytes = self.api.download_replication_file(manifest_file_id).await?;
+        if sha256_hex(&manifest_bytes) != manifest_sha256 {
+            bail!("HA replication snapshot manifest SHA256 mismatch");
+        }
+        let manifest: ReplicationSnapshotManifest =
+            serde_json::from_slice(&manifest_bytes).context("parse HA snapshot manifest")?;
+        if manifest.protocol != REPLICATION_PAYLOAD_PROTOCOL
+            || manifest.cluster_id != self.cfg.cluster_id
+            || manifest.epoch != epoch
+            || manifest.generation != document.replication_snapshot_generation
+            || manifest.state_sha256 != expected_state_sha256
+        {
+            bail!("HA replication snapshot manifest does not match canonical state");
+        }
+
+        let mut sealed = Vec::new();
+        for part in &manifest.parts {
+            let bytes = self.api.download_replication_file(&part.file_id).await?;
+            if bytes.len() as u64 != part.size {
+                bail!("HA replication snapshot part size mismatch");
+            }
+            if sha256_hex(&bytes) != part.sha256 {
+                bail!("HA replication snapshot part SHA256 mismatch");
+            }
+            sealed.extend_from_slice(&bytes);
+        }
+        if sha256_hex(&sealed) != manifest.payload_sha256 {
+            bail!("HA replication snapshot payload SHA256 mismatch");
+        }
+
+        let aad = format!("snapshot:{}:{}", self.cfg.cluster_id, epoch);
+        let (envelope, state_sha256): (ReplicationSnapshotEnvelope, String) =
+            open_json(&sealed, &self.replication_key, &aad)?;
+        if state_sha256 != manifest.state_sha256
+            || envelope.protocol != REPLICATION_PAYLOAD_PROTOCOL
+            || envelope.cluster_id != self.cfg.cluster_id
+            || envelope.epoch != epoch
+            || envelope.generation != manifest.generation
+            || envelope.snapshot.generation != manifest.generation
+        {
+            bail!("HA replication snapshot payload does not match manifest");
+        }
+
+        db.apply_replication_snapshot(&envelope.snapshot)?;
+        db.set_meta(REPLICATION_EPOCH_META, epoch)?;
+        info!(
+            instance_id = %self.cfg.instance_id,
+            replication_generation = envelope.snapshot.generation,
+            "HA replication snapshot applied"
+        );
+        Ok(())
+    }
+
+    async fn apply_delta_chain(
+        &self,
+        db: &Db,
+        document: &HaDocument,
+        local_generation: u64,
+    ) -> Result<()> {
+        let epoch = document
+            .replication_epoch
+            .as_deref()
+            .context("HA delta chain has no replication epoch")?;
+        let mut generation = document.replication_generation;
+        let mut file_id = document
+            .replication_head_file_id
+            .clone()
+            .context("HA replication head file_id is missing")?;
+        let mut expected_sha256 = document
+            .replication_head_sha256
+            .clone()
+            .context("HA replication head SHA256 is missing")?;
+        let mut seen_files = HashSet::new();
+        let mut reverse_chain = Vec::new();
+
+        while generation > local_generation {
+            if reverse_chain.len() >= REPLICATION_MAX_CHAIN {
+                bail!("HA replication delta chain exceeds safety limit");
+            }
+            if !seen_files.insert(file_id.clone()) {
+                bail!("HA replication delta chain contains a loop");
+            }
+
+            let sealed = self.api.download_replication_file(&file_id).await?;
+            if sha256_hex(&sealed) != expected_sha256 {
+                bail!("HA replication delta SHA256 mismatch at generation {generation}");
+            }
+            let aad = format!("delta:{}:{}", self.cfg.cluster_id, epoch);
+            let (delta, _): (ReplicationDelta, String) =
+                open_json(&sealed, &self.replication_key, &aad)?;
+
+            if delta.protocol != REPLICATION_PAYLOAD_PROTOCOL
+                || delta.cluster_id != self.cfg.cluster_id
+                || delta.epoch != epoch
+                || delta.generation != generation
+                || delta.previous_generation.saturating_add(1) != delta.generation
+            {
+                bail!("HA replication delta does not match canonical chain");
+            }
+
+            generation = delta.previous_generation;
+            if generation > local_generation {
+                file_id = delta
+                    .previous_file_id
+                    .clone()
+                    .context("HA replication delta chain ended before local generation")?;
+                expected_sha256 = delta
+                    .previous_sha256
+                    .clone()
+                    .context("HA replication delta chain has no previous SHA256")?;
+            }
+            reverse_chain.push(delta);
+        }
+
+        if generation != local_generation {
+            bail!(
+                "HA replication delta chain cannot reach local generation {}",
+                local_generation
+            );
+        }
+
+        for delta in reverse_chain.into_iter().rev() {
+            db.apply_replication_changes(
+                delta.previous_generation,
+                delta.generation,
+                &delta.changes,
+            )?;
+            info!(
+                instance_id = %self.cfg.instance_id,
+                replication_generation = delta.generation,
+                changes = delta.changes.len(),
+                "HA replication delta applied"
+            );
+        }
+        Ok(())
+    }
+
+    async fn upload_snapshot(
+        &self,
+        thread_id: i64,
+        epoch: &str,
+        snapshot: &ReplicationSnapshot,
+    ) -> Result<SnapshotUpload> {
+        let envelope = ReplicationSnapshotEnvelope {
+            protocol: REPLICATION_PAYLOAD_PROTOCOL,
+            cluster_id: self.cfg.cluster_id.clone(),
+            epoch: epoch.to_owned(),
+            generation: snapshot.generation,
+            source_instance: self.cfg.instance_id.clone(),
+            snapshot: snapshot.clone(),
+        };
+        let aad = format!("snapshot:{}:{}", self.cfg.cluster_id, epoch);
+        let (sealed, state_sha256) = seal_json(&envelope, &self.replication_key, &aad)?;
+        let payload_sha256 = sha256_hex(&sealed);
+        let chunk_size = (self.cfg.replication_snapshot_chunk_mib as usize) * 1024 * 1024;
+        let chunks = split_chunks(&sealed, chunk_size)?;
+        let mut parts = Vec::with_capacity(chunks.len());
+
+        for (index, chunk) in chunks.iter().enumerate() {
+            let file_name = format!(
+                "reddit2tg-ha-snapshot-{:020}.part{:04}.bin",
+                snapshot.generation,
+                index + 1
+            );
+            let caption = format!(
+                "reddit2tg HA snapshot · generation {} · part {}/{} · source {}",
+                snapshot.generation,
+                index + 1,
+                chunks.len(),
+                self.cfg.instance_id
+            );
+            let file_id = self
+                .api
+                .send_replication_file(thread_id, &file_name, &caption, chunk)
+                .await?;
+            parts.push(ReplicationFilePart {
+                file_id,
+                sha256: sha256_hex(chunk),
+                size: chunk.len() as u64,
+            });
+        }
+
+        let manifest = ReplicationSnapshotManifest {
+            protocol: REPLICATION_PAYLOAD_PROTOCOL,
+            cluster_id: self.cfg.cluster_id.clone(),
+            epoch: epoch.to_owned(),
+            generation: snapshot.generation,
+            state_sha256: state_sha256.clone(),
+            payload_sha256,
+            parts,
+        };
+        let manifest_bytes =
+            serde_json::to_vec(&manifest).context("serialize HA snapshot manifest")?;
+        let manifest_sha256 = sha256_hex(&manifest_bytes);
+        let manifest_file_name = format!(
+            "reddit2tg-ha-snapshot-{:020}.manifest.json",
+            snapshot.generation
+        );
+        let manifest_caption = format!(
+            "reddit2tg HA snapshot manifest · generation {} · source {}",
+            snapshot.generation, self.cfg.instance_id
+        );
+        let manifest_file_id = self
+            .api
+            .send_replication_file(
+                thread_id,
+                &manifest_file_name,
+                &manifest_caption,
+                &manifest_bytes,
+            )
+            .await?;
+
+        Ok(SnapshotUpload {
+            state_sha256,
+            manifest_file_id,
+            manifest_sha256,
+        })
+    }
+
+    async fn tick(&self, reddit: &RedditClient, db: &Db) -> Result<()> {
         let pinned = self.read_document().await?;
         let document = pinned.document;
         let now = now_ms();
@@ -994,13 +1819,15 @@ impl HaController {
                     .claim_started_at_ms
                     .saturating_add((self.cfg.claim_settle_secs as i64) * 1000);
                 if now >= settled_at {
-                    self.activate_settled_claim(reddit, &document).await?;
+                    self.activate_settled_claim(reddit, db, &document).await?;
                 }
                 return Ok(());
             }
 
             self.ensure_local_role(reddit, LocalRole::Standby).await?;
-            if claim_preemption_allowed(&self.cfg, &document, instance_id, now) {
+            if claim_preemption_allowed(&self.cfg, &document, instance_id, now)
+                && self.replication_ready(db, &document)?
+            {
                 self.try_claim().await?;
             }
             return Ok(());
@@ -1013,6 +1840,10 @@ impl HaController {
         }
 
         if *self.claim_cooldown_until_ms.lock().await > now {
+            return Ok(());
+        }
+
+        if !self.replication_ready(db, &document)? {
             return Ok(());
         }
 
@@ -1101,6 +1932,7 @@ impl HaController {
     async fn activate_settled_claim(
         &self,
         reddit: &RedditClient,
+        db: &Db,
         observed: &HaDocument,
     ) -> Result<()> {
         let now = now_ms();
@@ -1118,9 +1950,14 @@ impl HaController {
         *role_guard = LocalRole::Claiming;
 
         let current = self.read_document().await?.document;
-        if !self.owned_by_this_process(&current) || !current.claim_is_live(now_ms()) {
+        if !self.owned_by_this_process(&current)
+            || !current.claim_is_live(now_ms())
+            || !self.replication_ready(db, &current)?
+        {
             reddit.soft_disconnect().await?;
             *role_guard = LocalRole::Standby;
+            drop(role_guard);
+            self.release_failed_claim().await?;
             return Ok(());
         }
 
@@ -1887,7 +2724,7 @@ impl HaController {
             .max(0)
             / 1000;
         Ok(format!(
-            "reddit2tg HA status\ncluster: {}\nReddit phase: {}\nReddit owner: {}\nReddit lease: {}s\nhandover: {}\nHA command poller: {}\nHA command lease: {}s\ndata update offset: {}\ncontrol update offset: {}\ngeneration: {}",
+            "reddit2tg HA status\ncluster: {}\nReddit phase: {}\nReddit owner: {}\nReddit lease: {}s\nhandover: {}\nHA command poller: {}\nHA command lease: {}s\nha-sync thread: {}\nreplication generation: {}\nsnapshot generation: {}\ndata update offset: {}\ncontrol update offset: {}\ngeneration: {}",
             self.cfg.cluster_id,
             document.phase.as_str(),
             if document.owner_is_live(now) || document.claim_is_live(now) {
@@ -1903,6 +2740,12 @@ impl HaController {
                 "none"
             },
             control_remaining,
+            document
+                .sync_thread_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_owned()),
+            document.replication_generation,
+            document.replication_snapshot_generation,
             document.data_update_offset,
             document.control_update_offset,
             document.generation
@@ -1911,8 +2754,14 @@ impl HaController {
 
     async fn ensure_document(&self) -> Result<PinnedDocument> {
         if let Some(pinned) = self.api.read_pinned().await? {
+            let pinned = if pinned.document.protocol == 2 {
+                self.migrate_legacy_document(pinned).await?
+            } else {
+                pinned
+            };
             self.validate_document(&pinned.document)?;
             *self.state_message_id.lock().await = Some(pinned.message_id);
+            *self.sync_thread_id_cache.lock().await = pinned.document.sync_thread_id;
             return Ok(pinned);
         }
 
@@ -1927,7 +2776,89 @@ impl HaController {
         )?;
         self.validate_document(&pinned.document)?;
         *self.state_message_id.lock().await = Some(pinned.message_id);
+        *self.sync_thread_id_cache.lock().await = pinned.document.sync_thread_id;
         Ok(pinned)
+    }
+
+    async fn migrate_legacy_document(&self, pinned: PinnedDocument) -> Result<PinnedDocument> {
+        if !legacy_v2_document_matches_config(&self.cfg, &pinned.document) {
+            bail!("legacy HA protocol 2 document does not match this cluster configuration");
+        }
+        let now = now_ms();
+        if pinned.document.owner_is_live(now)
+            || pinned.document.claim_is_live(now)
+            || pinned.document.control_owner_is_live(now)
+        {
+            bail!(
+                "legacy HA protocol 2 lease is still live; stop all v0.4.0-alpha1 nodes and wait for the lease to expire before protocol 3 migration"
+            );
+        }
+
+        let _write_guard = self.document_write_lock.lock().await;
+        let fresh = self
+            .api
+            .read_pinned()
+            .await?
+            .context("legacy HA control document disappeared during migration")?;
+        if fresh.document.protocol == HA_PROTOCOL_VERSION {
+            self.validate_document(&fresh.document)?;
+            return Ok(fresh);
+        }
+        if !legacy_v2_document_matches_config(&self.cfg, &fresh.document) {
+            bail!("legacy HA control document changed during protocol migration");
+        }
+
+        let now = now_ms();
+        if fresh.document.owner_is_live(now)
+            || fresh.document.claim_is_live(now)
+            || fresh.document.control_owner_is_live(now)
+        {
+            bail!("legacy HA lease became live during protocol migration");
+        }
+
+        let mut next = fresh.document.clone();
+        next.protocol = HA_PROTOCOL_VERSION;
+        next.members_fingerprint = members_fingerprint(&self.cfg);
+        next.generation = next.generation.saturating_add(1);
+        next.written_at_ms = now;
+        if next.phase != ControlPhase::Paused {
+            next.phase = ControlPhase::Lease;
+        }
+        next.owner_nonce = None;
+        next.previous_owner = None;
+        next.previous_owner_priority = None;
+        next.claim_started_at_ms = 0;
+        next.lease_expires_at_ms = now;
+        next.handover_to = None;
+        next.request = None;
+        next.control_owner = None;
+        next.control_owner_nonce = None;
+        next.control_lease_expires_at_ms = now;
+        next.sync_thread_id = None;
+        next.replication_epoch = None;
+        next.replication_generation = 0;
+        next.replication_head_file_id = None;
+        next.replication_head_sha256 = None;
+        next.replication_snapshot_generation = 0;
+        next.replication_snapshot_state_sha256 = None;
+        next.replication_snapshot_manifest_file_id = None;
+        next.replication_snapshot_manifest_sha256 = None;
+
+        self.api.edit_document(fresh.message_id, &next).await?;
+        sleep(Duration::from_millis(150)).await;
+        let migrated = self
+            .api
+            .read_pinned()
+            .await?
+            .context("migrated HA control document is no longer pinned")?;
+        self.validate_document(&migrated.document)?;
+        info!(
+            instance_id = %self.cfg.instance_id,
+            data_update_offset = migrated.document.data_update_offset,
+            control_update_offset = migrated.document.control_update_offset,
+            "HA control document migrated from protocol 2 to protocol 3"
+        );
+        Ok(migrated)
     }
 
     async fn read_document(&self) -> Result<PinnedDocument> {
@@ -1935,6 +2866,7 @@ impl HaController {
             Ok(Some(pinned)) => {
                 self.validate_document(&pinned.document)?;
                 *self.state_message_id.lock().await = Some(pinned.message_id);
+                *self.sync_thread_id_cache.lock().await = pinned.document.sync_thread_id;
                 return Ok(pinned);
             }
             Ok(None) => {}
@@ -1954,6 +2886,7 @@ impl HaController {
                         .context("cached HA state message was re-pinned but getChat returned no pinned message")?;
                     self.validate_document(&pinned.document)?;
                     *self.state_message_id.lock().await = Some(pinned.message_id);
+                    *self.sync_thread_id_cache.lock().await = pinned.document.sync_thread_id;
                     return Ok(pinned);
                 }
                 return Err(first_error);
@@ -2125,6 +3058,43 @@ pub fn members_by_priority(cfg: &HaConfig) -> Vec<&HaInstanceConfig> {
     members
 }
 
+fn legacy_members_fingerprint_v2(cfg: &HaConfig) -> String {
+    let mut bytes = format!(
+        "thread={};ttl={};renew={};settle={};margin={};",
+        cfg.control_thread_id,
+        cfg.lease_ttl_secs,
+        cfg.renew_interval_secs,
+        cfg.claim_settle_secs,
+        cfg.fail_closed_margin_secs
+    )
+    .into_bytes();
+    for configured in members_by_priority(cfg) {
+        bytes.extend_from_slice(configured.id.as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(configured.priority.to_string().as_bytes());
+        bytes.push(b':');
+        bytes.push(u8::from(configured.auto_failover));
+        bytes.push(b':');
+        bytes.push(u8::from(configured.allow_fallback));
+        bytes.push(b':');
+        bytes.push(u8::from(configured.auto_failback));
+        bytes.push(b';');
+    }
+
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn legacy_v2_document_matches_config(cfg: &HaConfig, document: &HaDocument) -> bool {
+    document.protocol == 2
+        && document.cluster_id == cfg.cluster_id
+        && document.members_fingerprint == legacy_members_fingerprint_v2(cfg)
+}
+
 pub fn members_fingerprint(cfg: &HaConfig) -> String {
     let mut bytes = format!(
         "thread={};ttl={};renew={};settle={};margin={};replicate={};batch={};snapshot={};chunk={};",
@@ -2176,8 +3146,11 @@ pub fn encode_document(document: &HaDocument) -> Result<String> {
 }
 
 pub fn decode_document(text: &str) -> Option<Result<HaDocument>> {
-    let json = text.strip_prefix(HA_CONTROL_PREFIX)?;
-    Some(serde_json::from_str(json).context("parse HA control document"))
+    if let Some(json) = text.strip_prefix(HA_CONTROL_PREFIX) {
+        return Some(serde_json::from_str(json).context("parse HA control document"));
+    }
+    let json = text.strip_prefix(HA_LEGACY_CONTROL_PREFIX)?;
+    Some(serde_json::from_str(json).context("parse legacy HA control document"))
 }
 
 fn election_previous_owner<'a>(
@@ -2484,6 +3457,188 @@ mod tests {
         }
     }
 
+    fn temp_replication_db(label: &str) -> Db {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "reddit2tg-ha-transport-{label}-{}-{unique}.sqlite3",
+            std::process::id()
+        ));
+        Db::new(path).unwrap()
+    }
+
+    #[test]
+    fn logical_replication_transport_converges_two_sqlite_databases() {
+        let source = temp_replication_db("source");
+        let standby = temp_replication_db("standby");
+        let epoch = "00112233445566778899aabbccddeeff";
+        let key = derive_key("123:test-ha-token", "prod");
+
+        source
+            .save_matrix_session(&crate::db::StoredMatrixSession {
+                access_token: "source-local-token".to_owned(),
+                user_id: "@source:reddit".to_owned(),
+                expires_at_ms: Some(1111),
+            })
+            .unwrap();
+        standby
+            .save_matrix_session(&crate::db::StoredMatrixSession {
+                access_token: "standby-local-token".to_owned(),
+                user_id: "@standby:reddit".to_owned(),
+                expires_at_ms: Some(2222),
+            })
+            .unwrap();
+
+        source
+            .upsert_room("!room:reddit", 1001, "Alice", "joined")
+            .unwrap();
+        source.set_allow_delete("!room:reddit", true).unwrap();
+        source
+            .set_meta("matrix_next_batch", "baseline-batch")
+            .unwrap();
+
+        // Turn the seeded logical state into generation 1 before taking the
+        // baseline snapshot. This mirrors a cluster checkpoint with an empty
+        // pending change log.
+        let baseline_changes = source.pending_replication_changes(1000).unwrap();
+        assert!(!baseline_changes.is_empty());
+        let baseline_through = baseline_changes.last().unwrap().seq;
+        source
+            .mark_replication_published(baseline_through, 1)
+            .unwrap();
+
+        let snapshot = source.export_replication_snapshot().unwrap();
+        assert_eq!(snapshot.generation, 1);
+
+        let snapshot_envelope = ReplicationSnapshotEnvelope {
+            protocol: REPLICATION_PAYLOAD_PROTOCOL,
+            cluster_id: "prod".to_owned(),
+            epoch: epoch.to_owned(),
+            generation: snapshot.generation,
+            source_instance: "doma".to_owned(),
+            snapshot,
+        };
+        let snapshot_aad = format!("snapshot:prod:{epoch}");
+        let (sealed_snapshot, snapshot_sha) =
+            seal_json(&snapshot_envelope, &key, &snapshot_aad).unwrap();
+        let (decoded_snapshot, decoded_snapshot_sha): (ReplicationSnapshotEnvelope, String) =
+            open_json(&sealed_snapshot, &key, &snapshot_aad).unwrap();
+        assert_eq!(decoded_snapshot_sha, snapshot_sha);
+        assert_eq!(decoded_snapshot, snapshot_envelope);
+
+        standby
+            .apply_replication_snapshot(&decoded_snapshot.snapshot)
+            .unwrap();
+        source.set_meta(REPLICATION_EPOCH_META, epoch).unwrap();
+        standby.set_meta(REPLICATION_EPOCH_META, epoch).unwrap();
+
+        assert_eq!(
+            standby.load_matrix_session().unwrap().unwrap().access_token,
+            "standby-local-token"
+        );
+        assert_eq!(
+            source.load_matrix_session().unwrap().unwrap().access_token,
+            "source-local-token"
+        );
+
+        // Generate bridge changes after the checkpoint and transport them as
+        // the exact delta structure used by HA.
+        source.set_allow_delete("!room:reddit", false).unwrap();
+        source
+            .record_matrix_reply("!room:reddit", "$child", "$parent")
+            .unwrap();
+        source
+            .record_matrix_delivery_kind("!room:reddit", "$event", 1001, &[2001, 2002], "text")
+            .unwrap();
+        source
+            .save_message_snapshot(
+                "$event",
+                1001,
+                2001,
+                Some("encrypted replication test"),
+                None,
+                None,
+            )
+            .unwrap();
+        source.set_meta("matrix_next_batch", "delta-batch").unwrap();
+
+        let changes = source.pending_replication_changes(1000).unwrap();
+        assert!(!changes.is_empty());
+        let delta = ReplicationDelta {
+            protocol: REPLICATION_PAYLOAD_PROTOCOL,
+            cluster_id: "prod".to_owned(),
+            epoch: epoch.to_owned(),
+            generation: 2,
+            previous_generation: 1,
+            previous_file_id: None,
+            previous_sha256: None,
+            source_instance: "doma".to_owned(),
+            changes: changes.clone(),
+        };
+
+        let delta_aad = format!("delta:prod:{epoch}");
+        let (sealed_delta, _) = seal_json(&delta, &key, &delta_aad).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&sealed_delta).contains("encrypted replication test"),
+            "plaintext message leaked into encrypted replication payload"
+        );
+        let (decoded_delta, _): (ReplicationDelta, String) =
+            open_json(&sealed_delta, &key, &delta_aad).unwrap();
+        assert_eq!(decoded_delta, delta);
+
+        standby
+            .apply_replication_changes(
+                decoded_delta.previous_generation,
+                decoded_delta.generation,
+                &decoded_delta.changes,
+            )
+            .unwrap();
+        let through_seq = changes.last().unwrap().seq;
+        source.mark_replication_published(through_seq, 2).unwrap();
+
+        assert_eq!(source.replication_generation().unwrap(), 2);
+        assert_eq!(standby.replication_generation().unwrap(), 2);
+        assert_eq!(
+            source.export_replication_snapshot().unwrap(),
+            standby.export_replication_snapshot().unwrap()
+        );
+        assert_eq!(
+            standby
+                .room_by_matrix("!room:reddit")
+                .unwrap()
+                .unwrap()
+                .telegram_thread_id,
+            1001
+        );
+        assert!(!standby.allow_delete("!room:reddit").unwrap());
+        assert_eq!(
+            standby
+                .matrix_event_for_telegram(1001, 2001)
+                .unwrap()
+                .as_deref(),
+            Some("$event")
+        );
+        assert_eq!(
+            standby.get_meta("matrix_next_batch").unwrap().as_deref(),
+            Some("delta-batch")
+        );
+        assert_eq!(
+            standby.get_meta(REPLICATION_EPOCH_META).unwrap().as_deref(),
+            Some(epoch)
+        );
+        assert!(source.pending_replication_changes(1).unwrap().is_empty());
+        assert!(standby.pending_replication_changes(1).unwrap().is_empty());
+
+        // Matrix authentication remains node-local even after both snapshot
+        // and delta application.
+        assert_eq!(
+            standby.load_matrix_session().unwrap().unwrap().access_token,
+            "standby-local-token"
+        );
+    }
+
     #[test]
     fn config_accepts_valid_cluster() {
         validate_config(&cfg()).unwrap();
@@ -2502,6 +3657,30 @@ mod tests {
         let mut second = cfg();
         second.instances.reverse();
         assert_eq!(members_fingerprint(&first), members_fingerprint(&second));
+    }
+
+    #[test]
+    fn legacy_v2_fingerprint_differs_from_protocol3_fingerprint() {
+        let config = cfg();
+        assert_ne!(
+            legacy_members_fingerprint_v2(&config),
+            members_fingerprint(&config)
+        );
+    }
+
+    #[test]
+    fn legacy_v2_document_is_decoded_with_replication_defaults() {
+        let config = cfg();
+        let mut legacy = HaDocument::new(&config, 1000);
+        legacy.protocol = 2;
+        legacy.members_fingerprint = legacy_members_fingerprint_v2(&config);
+        legacy.data_update_offset = 1234;
+        let json = serde_json::to_string(&legacy).unwrap();
+        let text = format!("{HA_LEGACY_CONTROL_PREFIX}{json}");
+        let decoded = decode_document(&text).unwrap().unwrap();
+        assert_eq!(decoded.protocol, 2);
+        assert_eq!(decoded.data_update_offset, 1234);
+        assert!(legacy_v2_document_matches_config(&config, &decoded));
     }
 
     #[test]

@@ -27,9 +27,14 @@ refresh_before_secs = 3600
 # same telegram.bot_token (data bot), but only the active Reddit lease owner
 # calls getUpdates on that bot.
 #
-# HA administration uses one separate shared control bot. Create one reserved
-# forum topic named "ha-control-room" in telegram.chat_id and set its numeric
-# message_thread_id below. All HA commands and the pinned HA state live there.
+# HA administration uses one separate shared HA bot. Create one reserved forum
+# topic named "ha-control-room" in telegram.chat_id and set its numeric
+# message_thread_id below. Human HA commands and the pinned canonical state live
+# there. Grant the HA bot both Pin Messages and Manage Topics.
+#
+# Protocol 3 automatically creates a second reserved topic named "ha-sync".
+# Encrypted replication deltas and snapshots are stored there; its thread ID is
+# discovered automatically and persisted in the canonical HA document.
 #
 # All HA nodes in one cluster must use the same cluster_id, control_bot_token,
 # control_thread_id, lease timings and identical [[ha.instances]] membership.
