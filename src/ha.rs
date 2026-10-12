@@ -754,7 +754,22 @@ impl HaTelegramClient {
             {
                 Ok(())
             }
-            Err(error) => Err(error),
+            Err(error) => match self.read_pinned().await {
+                Ok(Some(pinned)) if pinned.message_id == message_id => {
+                    warn!(
+                        error = %format!("{error:#}"),
+                        message_id,
+                        "HA pin write returned an error but read-back confirms the expected pin"
+                    );
+                    Ok(())
+                }
+                Ok(_) => Err(error).context(
+                    "HA pin write failed and read-back did not confirm the expected pin",
+                ),
+                Err(verify_error) => bail!(
+                    "HA pin write failed: {error:#}; pin read-back verification failed: {verify_error:#}"
+                ),
+            },
         }
     }
 
@@ -770,7 +785,11 @@ impl HaTelegramClient {
                 }),
             )
             .await?;
-        self.ensure_pinned(message_id).await?;
+
+        // Editing a pinned Telegram message does not unpin it. Re-pinning after
+        // every canonical edit adds another control-plane write and, worse, a
+        // pinChatMessage timeout can make an already committed edit look failed.
+        // read_document() verifies the latest pin before and after each update.
         Ok(())
     }
 
@@ -2332,6 +2351,14 @@ impl HaController {
 
         if document.owner_is_live(now) {
             if self.owned_by_this_process(&document) {
+                // A previous lease renewal may have committed on Telegram even
+                // if its HTTP response timed out. Every successful canonical
+                // read of our own live lease is authoritative, so refresh the
+                // local fail-closed deadline before doing more work.
+                if *self.role.read().await == LocalRole::Active {
+                    *self.lease_expires_at_ms.lock().await = document.lease_expires_at_ms;
+                }
+
                 if document
                     .handover_to
                     .as_deref()
@@ -3537,13 +3564,45 @@ impl HaController {
 
             next.generation = pinned.document.generation.saturating_add(1);
             next.written_at_ms = now_ms();
-            self.api.edit_document(pinned.message_id, &next).await?;
+
+            let edit_result = self.api.edit_document(pinned.message_id, &next).await;
             *self.state_message_id.lock().await = Some(pinned.message_id);
             last_written = Some((pinned.message_id, next.clone()));
 
+            if let Err(edit_error) = edit_result {
+                // A request timeout is ambiguous: Telegram can commit the edit
+                // and lose/delay only the HTTP response. Verify canonical state
+                // once before surfacing the error so callers do not leave local
+                // SQLite behind a write that actually became authoritative.
+                sleep(Duration::from_millis(120)).await;
+                match self.read_document().await {
+                    Ok(verify)
+                        if control_write_readback_matches(&verify, pinned.message_id, &next) =>
+                    {
+                        warn!(
+                            error = %format!("{edit_error:#}"),
+                            message_id = pinned.message_id,
+                            generation = next.generation,
+                            "HA control write returned an error but read-back confirms commit"
+                        );
+                        return Ok(next);
+                    }
+                    Ok(_) => {
+                        return Err(edit_error).context(
+                            "HA control document write failed and read-back did not confirm commit",
+                        );
+                    }
+                    Err(verify_error) => {
+                        bail!(
+                            "HA control document write failed: {edit_error:#}; read-back verification failed: {verify_error:#}"
+                        );
+                    }
+                }
+            }
+
             sleep(Duration::from_millis(120)).await;
             let verify = self.read_document().await?;
-            if verify.message_id == pinned.message_id && verify.document == next {
+            if control_write_readback_matches(&verify, pinned.message_id, &next) {
                 return Ok(next);
             }
 
@@ -3591,6 +3650,14 @@ where
         result = &mut admin => result.context("HA admin runtime loop stopped"),
         result = &mut replication => result.context("HA replication runtime loop stopped"),
     }
+}
+
+fn control_write_readback_matches(
+    pinned: &PinnedDocument,
+    message_id: i64,
+    expected: &HaDocument,
+) -> bool {
+    pinned.message_id == message_id && &pinned.document == expected
 }
 
 fn control_request_timeout(cfg: &HaConfig) -> Duration {
@@ -4318,6 +4385,25 @@ mod tests {
             ticks >= 8,
             "lease runtime was starved by slow replication: only {ticks} ticks observed"
         );
+    }
+
+    #[test]
+    fn control_write_readback_requires_exact_expected_document() {
+        let cfg = cfg();
+        let mut expected = HaDocument::new(&cfg, 123);
+        expected.generation = 17;
+        expected.written_at_ms = 456;
+
+        let pinned = PinnedDocument {
+            message_id: 9001,
+            document: expected.clone(),
+        };
+        assert!(control_write_readback_matches(&pinned, 9001, &expected));
+        assert!(!control_write_readback_matches(&pinned, 9002, &expected));
+
+        let mut different = expected.clone();
+        different.generation = different.generation.saturating_add(1);
+        assert!(!control_write_readback_matches(&pinned, 9001, &different));
     }
 
     #[test]
