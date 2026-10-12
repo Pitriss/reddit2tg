@@ -20,3 +20,43 @@ path = "/var/lib/reddit2tg/reddit2tg.sqlite3"
 matrix_timeout_ms = 10000
 telegram_timeout_secs = 45
 refresh_before_secs = 3600
+
+# Optional multi-instance HA control plane. Keep disabled for a single instance.
+# All HA nodes in one cluster must use the same cluster_id, control_bot_token,
+# control_chat_id and identical [[ha.instances]] membership/policies.
+# Each node sets only ha.instance_id to its own member id.
+#
+# The control bot is separate from telegram.bot_token and is reserved for HA
+# lease/control state. Runtime integration will use a pinned control message as
+# the fencing token; Reddit authentication is allowed only to the lease owner.
+[ha]
+enabled = false
+# cluster_id = "prod"
+# instance_id = "ostrava"
+# control_bot_token = "123456789:PASTE_SHARED_HA_CONTROL_BOT_TOKEN_HERE"
+# control_chat_id = -1009876543210
+# lease_ttl_secs = 30
+# renew_interval_secs = 10
+# claim_settle_secs = 5
+# fail_closed_margin_secs = 5
+#
+# [[ha.instances]]
+# id = "ostrava"
+# priority = 10
+# auto_failover = true
+# allow_fallback = true
+# auto_failback = false
+#
+# [[ha.instances]]
+# id = "brno"
+# priority = 20
+# auto_failover = true
+# allow_fallback = true
+# auto_failback = false
+#
+# [[ha.instances]]
+# id = "praha"
+# priority = 30
+# auto_failover = true
+# allow_fallback = true
+# auto_failback = false

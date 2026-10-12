@@ -1,6 +1,7 @@
 mod bridge;
 mod config;
 mod db;
+pub mod ha;
 mod reddit;
 mod telegram;
 

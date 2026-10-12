@@ -11,6 +11,8 @@ pub struct Config {
     pub storage: StorageConfig,
     #[serde(default)]
     pub bridge: BridgeConfig,
+    #[serde(default)]
+    pub ha: HaConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -61,6 +63,59 @@ impl Default for BridgeConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct HaConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub cluster_id: String,
+    #[serde(default)]
+    pub instance_id: String,
+    #[serde(default)]
+    pub control_bot_token: String,
+    #[serde(default)]
+    pub control_chat_id: i64,
+    #[serde(default = "default_ha_lease_ttl_secs")]
+    pub lease_ttl_secs: u64,
+    #[serde(default = "default_ha_renew_interval_secs")]
+    pub renew_interval_secs: u64,
+    #[serde(default = "default_ha_claim_settle_secs")]
+    pub claim_settle_secs: u64,
+    #[serde(default = "default_ha_fail_closed_margin_secs")]
+    pub fail_closed_margin_secs: u64,
+    #[serde(default)]
+    pub instances: Vec<HaInstanceConfig>,
+}
+
+impl Default for HaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cluster_id: String::new(),
+            instance_id: String::new(),
+            control_bot_token: String::new(),
+            control_chat_id: 0,
+            lease_ttl_secs: default_ha_lease_ttl_secs(),
+            renew_interval_secs: default_ha_renew_interval_secs(),
+            claim_settle_secs: default_ha_claim_settle_secs(),
+            fail_closed_margin_secs: default_ha_fail_closed_margin_secs(),
+            instances: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HaInstanceConfig {
+    pub id: String,
+    pub priority: u32,
+    #[serde(default = "default_true")]
+    pub auto_failover: bool,
+    #[serde(default = "default_true")]
+    pub allow_fallback: bool,
+    #[serde(default)]
+    pub auto_failback: bool,
+}
+
 fn default_homeserver() -> String {
     "https://matrix.redditspace.com".to_owned()
 }
@@ -77,6 +132,21 @@ const fn default_telegram_timeout_secs() -> u64 {
 }
 const fn default_refresh_before_secs() -> u64 {
     3_600
+}
+const fn default_ha_lease_ttl_secs() -> u64 {
+    30
+}
+const fn default_ha_renew_interval_secs() -> u64 {
+    10
+}
+const fn default_ha_claim_settle_secs() -> u64 {
+    5
+}
+const fn default_ha_fail_closed_margin_secs() -> u64 {
+    5
+}
+const fn default_true() -> bool {
+    true
 }
 
 impl Config {
@@ -108,6 +178,7 @@ impl Config {
         if self.bridge.telegram_timeout_secs < 1 || self.bridge.telegram_timeout_secs > 50 {
             bail!("bridge.telegram_timeout_secs must be in 1..50");
         }
+        crate::ha::validate_config(&self.ha)?;
         Ok(())
     }
 
