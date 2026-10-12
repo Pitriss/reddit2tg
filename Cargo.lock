@@ -1162,7 +1162,7 @@ dependencies = [
 
 [[package]]
 name = "reddit2tg"
-version = "0.4.0-alpha1"
+version = "0.4.0-alpha2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
