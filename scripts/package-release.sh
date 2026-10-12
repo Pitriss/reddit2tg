@@ -14,6 +14,11 @@ command -v tar >/dev/null 2>&1 || { echo "tar not found" >&2; exit 1; }
 VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
 [ -n "$VERSION" ] || { echo "cannot read version from Cargo.toml" >&2; exit 1; }
 
+# Cargo uses SemVer prerelease syntax such as 0.4.0-alpha1. Debian sorts a
+# hyphen differently, so package metadata uses '~' to ensure the prerelease
+# sorts before the final release: 0.4.0~alpha1 < 0.4.0.
+DEB_VERSION=$(printf '%s' "$VERSION" | sed 's/-/~/')
+
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/reddit2tg-package.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT HUP INT TERM
 mkdir -p "$DIST"
@@ -44,7 +49,7 @@ install -m 0644 etc/systemd/system/reddit2tg.service "$DEB_ROOT/lib/systemd/syst
 
 cat > "$DEB_ROOT/DEBIAN/control" <<EOF_CONTROL
 Package: reddit2tg
-Version: $VERSION
+Version: $DEB_VERSION
 Section: net
 Priority: optional
 Architecture: $ARCH
