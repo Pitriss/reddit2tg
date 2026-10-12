@@ -5,7 +5,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Local, Utc};
 use image::{DynamicImage, ImageFormat, ImageReader, Limits, RgbaImage};
 use serde_json::Value;
@@ -36,6 +36,21 @@ pub struct Bridge {
 
 const DEFAULT_HISTORY_LIMIT: usize = 50;
 const MAX_HISTORY_LIMIT: usize = 2000;
+const MAX_CONSECUTIVE_RUNTIME_FAILURES: u32 = 3;
+
+fn runtime_recovery_required(consecutive_failures: u32) -> bool {
+    consecutive_failures >= MAX_CONSECUTIVE_RUNTIME_FAILURES
+}
+
+fn runtime_client_recovery_error(error: &anyhow::Error) -> bool {
+    if is_auth_refresh_error(error) {
+        return false;
+    }
+
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<reqwest::Error>().is_some())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HistoryCommandKind {
@@ -96,6 +111,11 @@ impl Bridge {
             expires_in_secs = ?session.expires_in_secs(),
             "configuration probe successful"
         );
+        Ok(())
+    }
+
+    pub async fn probe_runtime_config(&self) -> Result<()> {
+        self.telegram.probe().await?;
         Ok(())
     }
 
@@ -922,7 +942,6 @@ impl Bridge {
     }
 
     pub async fn run(self) -> Result<()> {
-        self.telegram.probe().await?;
         match self.reddit.authenticate().await {
             Ok(session) => {
                 info!(
@@ -941,30 +960,79 @@ impl Bridge {
 
         let matrix = self.clone();
         let telegram = self.clone();
-        let matrix_task = tokio::spawn(async move { matrix.matrix_loop().await });
-        let telegram_task = tokio::spawn(async move { telegram.telegram_loop().await });
+        let mut matrix_task = tokio::spawn(async move { matrix.matrix_loop().await });
+        let mut telegram_task = tokio::spawn(async move { telegram.telegram_loop().await });
 
         tokio::select! {
-            result = matrix_task => result.context("matrix task join failed")??,
-            result = telegram_task => result.context("telegram task join failed")??,
-            _ = tokio::signal::ctrl_c() => info!("shutdown requested"),
+            result = &mut matrix_task => {
+                telegram_task.abort();
+                let _ = telegram_task.await;
+                match result {
+                    Ok(result) => result.context("Matrix worker requested runtime recovery"),
+                    Err(error) => Err(anyhow!("Matrix worker task failed: {error}")),
+                }
+            }
+            result = &mut telegram_task => {
+                matrix_task.abort();
+                let _ = matrix_task.await;
+                match result {
+                    Ok(result) => result.context("Telegram worker requested runtime recovery"),
+                    Err(error) => Err(anyhow!("Telegram worker task failed: {error}")),
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                matrix_task.abort();
+                telegram_task.abort();
+                let _ = matrix_task.await;
+                let _ = telegram_task.await;
+                info!("shutdown requested");
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     async fn matrix_loop(&self) -> Result<()> {
         let mut backoff = 1u64;
+        let mut consecutive_client_failures = 0u32;
         loop {
             match self.matrix_iteration().await {
                 Ok(()) => {
                     backoff = 1;
+                    consecutive_client_failures = 0;
                     self.notify_auth_recovered_once().await;
                 }
                 Err(err) => {
+                    let client_recovery_error = runtime_client_recovery_error(&err);
+                    if client_recovery_error {
+                        consecutive_client_failures = consecutive_client_failures.saturating_add(1);
+                    } else {
+                        consecutive_client_failures = 0;
+                    }
+
                     if is_auth_refresh_error(&err) {
                         self.notify_auth_failure_once().await;
                     }
-                    error!(error = %err, backoff_secs = backoff, "Matrix sync iteration failed");
+
+                    if client_recovery_error
+                        && runtime_recovery_required(consecutive_client_failures)
+                    {
+                        error!(
+                            error = %format!("{err:#}"),
+                            consecutive_client_failures,
+                            "Matrix HTTP client is unhealthy; requesting full runtime recovery"
+                        );
+                        return Err(err).context(
+                            "Matrix client exceeded consecutive transport failure threshold",
+                        );
+                    }
+
+                    error!(
+                        error = %format!("{err:#}"),
+                        backoff_secs = backoff,
+                        client_recovery_error,
+                        consecutive_client_failures,
+                        "Matrix sync iteration failed"
+                    );
                     sleep(Duration::from_secs(backoff)).await;
                     backoff = (backoff * 2).min(60);
                 }
@@ -1869,14 +1937,45 @@ impl Bridge {
 
     async fn telegram_loop(&self) -> Result<()> {
         let mut backoff = 1u64;
+        let mut consecutive_client_failures = 0u32;
         loop {
             match self.telegram_iteration().await {
-                Ok(()) => backoff = 1,
+                Ok(()) => {
+                    backoff = 1;
+                    consecutive_client_failures = 0;
+                }
                 Err(err) => {
+                    let client_recovery_error = runtime_client_recovery_error(&err);
+                    if client_recovery_error {
+                        consecutive_client_failures = consecutive_client_failures.saturating_add(1);
+                    } else {
+                        consecutive_client_failures = 0;
+                    }
+
                     if is_auth_refresh_error(&err) {
                         self.notify_auth_failure_once().await;
                     }
-                    error!(error = %format!("{err:#}"), backoff_secs = backoff, "Telegram polling iteration failed");
+
+                    if client_recovery_error
+                        && runtime_recovery_required(consecutive_client_failures)
+                    {
+                        error!(
+                            error = %format!("{err:#}"),
+                            consecutive_client_failures,
+                            "Telegram/Reddit HTTP client is unhealthy; requesting full runtime recovery"
+                        );
+                        return Err(err).context(
+                            "Telegram worker exceeded consecutive transport failure threshold",
+                        );
+                    }
+
+                    error!(
+                        error = %format!("{err:#}"),
+                        backoff_secs = backoff,
+                        client_recovery_error,
+                        consecutive_client_failures,
+                        "Telegram polling iteration failed"
+                    );
                     sleep(Duration::from_secs(backoff)).await;
                     backoff = (backoff * 2).min(60);
                 }
@@ -2861,12 +2960,38 @@ mod tests {
     use super::{
         fallback_topic_color, general_help_text, history_timestamp, matrix_reply_target,
         parse_allow_delete_command, parse_help_command, parse_history_command,
-        parse_reconcile_names_command, profile_intro_text, startup_event_should_forward,
-        topic_color_from_avatar, topic_help_text, AllowDeleteCommand, HistoryCommand,
-        HistoryCommandKind, DEFAULT_HISTORY_LIMIT,
+        parse_reconcile_names_command, profile_intro_text, runtime_client_recovery_error,
+        runtime_recovery_required, startup_event_should_forward, topic_color_from_avatar,
+        topic_help_text, AllowDeleteCommand, HistoryCommand, HistoryCommandKind,
+        DEFAULT_HISTORY_LIMIT,
     };
     use crate::telegram::TELEGRAM_TOPIC_COLORS;
     use image::{Rgba, RgbaImage};
+
+    #[test]
+    fn runtime_recovery_requires_three_consecutive_failures() {
+        assert!(!runtime_recovery_required(0));
+        assert!(!runtime_recovery_required(1));
+        assert!(!runtime_recovery_required(2));
+        assert!(runtime_recovery_required(3));
+        assert!(runtime_recovery_required(4));
+    }
+
+    #[test]
+    fn runtime_client_recovery_ignores_application_errors() {
+        let application_error = anyhow::anyhow!("message-specific application failure");
+        assert!(!runtime_client_recovery_error(&application_error));
+    }
+
+    #[test]
+    fn runtime_client_recovery_detects_reqwest_errors() {
+        let reqwest_error = reqwest::Client::new()
+            .get("://invalid-url")
+            .build()
+            .expect_err("invalid URL should produce reqwest::Error");
+        let error = anyhow::Error::new(reqwest_error);
+        assert!(runtime_client_recovery_error(&error));
+    }
 
     #[test]
     fn delete_archived_command_accepts_general_command_forms() {

@@ -348,6 +348,18 @@ Stop it with `Ctrl+C`.
 
 Do not simultaneously run another process using `getUpdates` with the same Telegram bot token. Bot API updates are a single stream and competing consumers will interfere with each other.
 
+### Runtime communication recovery
+
+The long-running bridge continuously exercises both transports even when the chats are idle: Matrix `/sync` polls Reddit Chat and Telegram `getUpdates` polls Telegram. These normal polling cycles therefore also act as transport health checks.
+
+Matrix session refresh is serialized between the Matrix polling worker and the Telegram-to-Reddit worker. If both workers notice an expiring or rejected Matrix token at the same time, only one worker refreshes it; a stale HTTP 401 from the other worker cannot invalidate the newer shared session.
+
+Three consecutive recoverable HTTP-client failures ask the runtime supervisor for a full recovery. Message-specific application failures and Reddit authentication-refresh failures keep their normal retry/backoff path and do not recycle the whole runtime. The supervisor cancels the sibling worker, waits five seconds, creates fresh Reddit and Telegram HTTP clients, restores/revalidates the Matrix session, and resumes polling. This recovery is internal to `reddit2tg`, so it also works when the daemon is run under the supplied SysV init script, which does not provide automatic process respawn.
+
+The Telegram configuration/permission probe is intentionally performed once before the recoverable runtime starts. A bad bot token, wrong chat, active webhook, or missing Manage Topics permission therefore remains a startup error instead of causing an endless internal restart loop.
+
+Telegram update offsets are still persisted only after an accepted update has been processed successfully. Therefore a Telegram message whose Reddit delivery fails during a runtime recovery is fetched and retried after the clients are recreated instead of being acknowledged and lost.
+
 ### Reconcile existing Telegram topic names
 
 Existing room mappings can be rechecked against current Reddit/Matrix membership without creating a new chat or sending a Reddit message. A dry run only reports differences:

@@ -10,7 +10,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use reqwest::{header::CONTENT_TYPE, Client, StatusCode};
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
 use crate::{
@@ -77,6 +77,7 @@ pub struct RedditClient {
     homeserver: String,
     cookie_header: String,
     session: Arc<RwLock<Option<MatrixSession>>>,
+    refresh_lock: Arc<Mutex<()>>,
     cached_own_display_name: Arc<RwLock<Option<String>>>,
     db: Db,
 }
@@ -226,12 +227,25 @@ impl RedditClient {
             homeserver: cfg.reddit.homeserver.trim_end_matches('/').to_owned(),
             cookie_header: cfg.reddit_cookie_header(),
             session: Arc::new(RwLock::new(None)),
+            refresh_lock: Arc::new(Mutex::new(())),
             cached_own_display_name: Arc::new(RwLock::new(None)),
             db,
         })
     }
 
     pub async fn authenticate(&self) -> Result<MatrixSession> {
+        let _refresh_guard = self.refresh_lock.lock().await;
+
+        if let Some(current) = self.session.read().await.clone() {
+            if !expires_soon(current.expires_at_ms, 0) {
+                return Ok(current);
+            }
+        }
+
+        self.authenticate_locked().await
+    }
+
+    async fn authenticate_locked(&self) -> Result<MatrixSession> {
         if cookie_value(&self.cookie_header, "reddit_session").is_none() {
             return Err(auth_error(
                 "reddit.session is missing reddit_session cookie",
@@ -281,7 +295,7 @@ impl RedditClient {
             }
         }
 
-        self.refresh_matrix_session().await
+        self.refresh_matrix_session_locked().await
     }
 
     pub async fn ensure_session(&self, refresh_before_secs: u64) -> Result<MatrixSession> {
@@ -289,28 +303,40 @@ impl RedditClient {
             if !expires_soon(current.expires_at_ms, refresh_before_secs) {
                 return Ok(current);
             }
+        }
+
+        let _refresh_guard = self.refresh_lock.lock().await;
+
+        if let Some(current) = self.session.read().await.clone() {
+            if !expires_soon(current.expires_at_ms, refresh_before_secs) {
+                info!(
+                    expires_in_secs = ?current.expires_in_secs(),
+                    "Matrix session was refreshed by another worker; reusing it"
+                );
+                return Ok(current);
+            }
+
             info!(
                 expires_in_secs = ?current.expires_in_secs(),
                 refresh_before_secs,
                 "Matrix session is near expiry; refreshing"
             );
-            return self.refresh_matrix_session().await;
+            return self.refresh_matrix_session_locked().await;
         }
 
-        self.authenticate().await?;
-        let current = self
-            .session
-            .read()
-            .await
-            .clone()
-            .ok_or_else(|| anyhow!("authentication succeeded without Matrix session"))?;
+        let current = self.authenticate_locked().await?;
         if expires_soon(current.expires_at_ms, refresh_before_secs) {
-            return self.refresh_matrix_session().await;
+            info!(
+                expires_in_secs = ?current.expires_in_secs(),
+                refresh_before_secs,
+                "newly authenticated Matrix session is near expiry; refreshing"
+            );
+            return self.refresh_matrix_session_locked().await;
         }
         Ok(current)
     }
 
-    async fn refresh_matrix_session(&self) -> Result<MatrixSession> {
+    async fn refresh_matrix_session_locked(&self) -> Result<MatrixSession> {
         if cookie_value(&self.cookie_header, "reddit_session").is_none() {
             return Err(auth_error(
                 "reddit.session is missing reddit_session cookie",
@@ -479,13 +505,54 @@ impl RedditClient {
         Ok(())
     }
 
-    async fn refresh_after_unauthorized(&self, operation: &str) -> Result<()> {
+    async fn refresh_after_unauthorized(
+        &self,
+        operation: &str,
+        rejected_access_token: &str,
+    ) -> Result<()> {
+        let _refresh_guard = self.refresh_lock.lock().await;
+
+        let current_access_token = self
+            .session
+            .read()
+            .await
+            .as_ref()
+            .map(|current| current.access_token.clone());
+        if current_access_token.is_some()
+            && !rejected_token_is_current(current_access_token.as_deref(), rejected_access_token)
+        {
+            info!(
+                operation,
+                "Matrix 401 belonged to a superseded session; reusing newer session"
+            );
+            return Ok(());
+        }
+
         warn!(
             operation,
-            "Matrix returned 401; invalidating session and refreshing once"
+            "Matrix returned 401 for current session; invalidating and refreshing once"
         );
         self.invalidate_session().await?;
-        self.refresh_matrix_session().await?;
+        self.refresh_matrix_session_locked().await?;
+        Ok(())
+    }
+
+    async fn invalidate_rejected_session(&self, rejected_access_token: &str) -> Result<()> {
+        let _refresh_guard = self.refresh_lock.lock().await;
+        let current_access_token = self
+            .session
+            .read()
+            .await
+            .as_ref()
+            .map(|current| current.access_token.clone());
+        let should_invalidate =
+            rejected_token_is_current(current_access_token.as_deref(), rejected_access_token);
+
+        if should_invalidate {
+            self.invalidate_session().await?;
+        } else {
+            info!("stale Matrix 401 did not invalidate a newer shared session");
+        }
         Ok(())
     }
 
@@ -518,10 +585,12 @@ impl RedditClient {
             let response = req.send().await.context("Matrix /sync request failed")?;
             if response.status() == StatusCode::UNAUTHORIZED {
                 if attempt == 0 {
-                    self.refresh_after_unauthorized("sync").await?;
+                    self.refresh_after_unauthorized("sync", &session.access_token)
+                        .await?;
                     continue;
                 }
-                self.invalidate_session().await?;
+                self.invalidate_rejected_session(&session.access_token)
+                    .await?;
                 return Err(auth_error(
                     "Matrix /sync rejected the refreshed access token",
                 ));
@@ -557,10 +626,12 @@ impl RedditClient {
                 .context("Matrix media download request failed")?;
             if response.status() == StatusCode::UNAUTHORIZED {
                 if attempt == 0 {
-                    self.refresh_after_unauthorized("media download").await?;
+                    self.refresh_after_unauthorized("media download", &session.access_token)
+                        .await?;
                     continue;
                 }
-                self.invalidate_session().await?;
+                self.invalidate_rejected_session(&session.access_token)
+                    .await?;
                 return Err(auth_error(
                     "Matrix media download rejected the refreshed access token",
                 ));
@@ -722,10 +793,12 @@ impl RedditClient {
                 .context("Matrix media upload request failed")?;
             if response.status() == StatusCode::UNAUTHORIZED {
                 if attempt == 0 {
-                    self.refresh_after_unauthorized("media upload").await?;
+                    self.refresh_after_unauthorized("media upload", &session.access_token)
+                        .await?;
                     continue;
                 }
-                self.invalidate_session().await?;
+                self.invalidate_rejected_session(&session.access_token)
+                    .await?;
                 return Err(auth_error(
                     "Matrix media upload rejected the refreshed access token",
                 ));
@@ -798,10 +871,12 @@ impl RedditClient {
                 .context("Matrix send image request failed")?;
             if response.status() == StatusCode::UNAUTHORIZED {
                 if attempt == 0 {
-                    self.refresh_after_unauthorized("send image").await?;
+                    self.refresh_after_unauthorized("send image", &session.access_token)
+                        .await?;
                     continue;
                 }
-                self.invalidate_session().await?;
+                self.invalidate_rejected_session(&session.access_token)
+                    .await?;
                 return Err(auth_error(
                     "Matrix send image rejected the refreshed access token",
                 ));
@@ -848,11 +923,12 @@ impl RedditClient {
 
             if response.status() == StatusCode::UNAUTHORIZED {
                 if attempt == 0 {
-                    self.refresh_after_unauthorized("reply target lookup")
+                    self.refresh_after_unauthorized("reply target lookup", &session.access_token)
                         .await?;
                     continue;
                 }
-                self.invalidate_session().await?;
+                self.invalidate_rejected_session(&session.access_token)
+                    .await?;
                 return Err(auth_error(
                     "Matrix reply target lookup rejected the refreshed access token",
                 ));
@@ -917,10 +993,12 @@ impl RedditClient {
                 .context("Matrix send message request failed")?;
             if response.status() == StatusCode::UNAUTHORIZED {
                 if attempt == 0 {
-                    self.refresh_after_unauthorized("send message").await?;
+                    self.refresh_after_unauthorized("send message", &session.access_token)
+                        .await?;
                     continue;
                 }
-                self.invalidate_session().await?;
+                self.invalidate_rejected_session(&session.access_token)
+                    .await?;
                 return Err(auth_error(
                     "Matrix send rejected the refreshed access token",
                 ));
@@ -976,10 +1054,12 @@ impl RedditClient {
                 .with_context(|| format!("Matrix {action} room request failed"))?;
             if response.status() == StatusCode::UNAUTHORIZED {
                 if attempt == 0 {
-                    self.refresh_after_unauthorized(action).await?;
+                    self.refresh_after_unauthorized(action, &session.access_token)
+                        .await?;
                     continue;
                 }
-                self.invalidate_session().await?;
+                self.invalidate_rejected_session(&session.access_token)
+                    .await?;
                 return Err(auth_error(format!(
                     "Matrix {action} rejected the refreshed access token"
                 )));
@@ -1019,10 +1099,12 @@ impl RedditClient {
                 .context("Matrix read_markers request failed")?;
             if response.status() == StatusCode::UNAUTHORIZED {
                 if attempt == 0 {
-                    self.refresh_after_unauthorized("read markers").await?;
+                    self.refresh_after_unauthorized("read markers", &session.access_token)
+                        .await?;
                     continue;
                 }
-                self.invalidate_session().await?;
+                self.invalidate_rejected_session(&session.access_token)
+                    .await?;
                 return Err(auth_error(
                     "Matrix read_markers rejected the refreshed access token",
                 ));
@@ -1069,11 +1151,12 @@ impl RedditClient {
 
             if response.status() == StatusCode::UNAUTHORIZED {
                 if attempt == 0 {
-                    self.refresh_after_unauthorized("startup room history")
+                    self.refresh_after_unauthorized("startup room history", &session.access_token)
                         .await?;
                     continue;
                 }
-                self.invalidate_session().await?;
+                self.invalidate_rejected_session(&session.access_token)
+                    .await?;
                 return Err(auth_error(
                     "Matrix startup room history rejected the refreshed access token",
                 ));
@@ -1135,10 +1218,12 @@ impl RedditClient {
                     .context("Matrix room history request failed")?;
                 if response.status() == StatusCode::UNAUTHORIZED {
                     if attempt == 0 {
-                        self.refresh_after_unauthorized("room history").await?;
+                        self.refresh_after_unauthorized("room history", &session.access_token)
+                            .await?;
                         continue;
                     }
-                    self.invalidate_session().await?;
+                    self.invalidate_rejected_session(&session.access_token)
+                        .await?;
                     return Err(auth_error(
                         "Matrix room history rejected the refreshed access token",
                     ));
@@ -1416,6 +1501,13 @@ pub fn matrix_localpart(user_id: &str) -> String {
         .to_owned()
 }
 
+fn rejected_token_is_current(
+    current_access_token: Option<&str>,
+    rejected_access_token: &str,
+) -> bool {
+    current_access_token == Some(rejected_access_token)
+}
+
 fn cookie_value(cookie_header: &str, name: &str) -> Option<String> {
     cookie_header
         .split(';')
@@ -1506,9 +1598,17 @@ fn truncate(value: &str, max: usize) -> String {
 mod tests {
     use super::{
         counterpart_from_members, detect_supported_image_mime, extract_token_blob,
-        jwt_expires_at_ms, parse_mxc_uri, reddit_reply_relation, strip_cookie,
+        jwt_expires_at_ms, parse_mxc_uri, reddit_reply_relation, rejected_token_is_current,
+        strip_cookie,
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+    #[test]
+    fn rejected_401_only_matches_the_session_that_received_it() {
+        assert!(rejected_token_is_current(Some("old-token"), "old-token"));
+        assert!(!rejected_token_is_current(Some("new-token"), "old-token"));
+        assert!(!rejected_token_is_current(None, "old-token"));
+    }
 
     #[test]
     fn parses_mxc_media_uri() {

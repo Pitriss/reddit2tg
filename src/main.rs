@@ -4,10 +4,12 @@ mod db;
 mod reddit;
 mod telegram;
 
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use tokio::time::sleep;
+use tracing::error;
 use tracing_subscriber::EnvFilter;
 
 use crate::{
@@ -37,6 +39,41 @@ enum Command {
     },
 }
 
+const RUNTIME_RECOVERY_DELAY_SECS: u64 = 5;
+
+fn build_bridge(cfg: &Config, db: &Db) -> Result<Bridge> {
+    let reddit = RedditClient::new(cfg, db.clone())?;
+    let telegram = TelegramClient::new(
+        &cfg.telegram.bot_token,
+        cfg.telegram.chat_id,
+        cfg.telegram.operator_user_id,
+    )?;
+    Ok(Bridge::new(cfg.clone(), db.clone(), reddit, telegram))
+}
+
+async fn run_supervised(cfg: &Config, db: &Db) -> Result<()> {
+    let mut recovery_generation = 0u64;
+    let mut bridge = build_bridge(cfg, db)?;
+    bridge.probe_runtime_config().await?;
+
+    loop {
+        match bridge.run().await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                recovery_generation = recovery_generation.saturating_add(1);
+                error!(
+                    error = %format!("{error:#}"),
+                    recovery_generation,
+                    delay_secs = RUNTIME_RECOVERY_DELAY_SECS,
+                    "bridge runtime unhealthy; recreating Reddit and Telegram clients"
+                );
+                sleep(Duration::from_secs(RUNTIME_RECOVERY_DELAY_SECS)).await;
+                bridge = build_bridge(cfg, db)?;
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -50,19 +87,12 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = Config::load(&cli.config)?;
     let db = Db::new(&cfg.storage.path)?;
-    let reddit = RedditClient::new(&cfg, db.clone())?;
-    let telegram = TelegramClient::new(
-        &cfg.telegram.bot_token,
-        cfg.telegram.chat_id,
-        cfg.telegram.operator_user_id,
-    )?;
-    let bridge = Bridge::new(cfg, db, reddit, telegram);
 
     match cli.command.unwrap_or(Command::Run) {
-        Command::Run => bridge.run().await,
-        Command::Check => bridge.check().await,
+        Command::Run => run_supervised(&cfg, &db).await,
+        Command::Check => build_bridge(&cfg, &db)?.check().await,
         Command::ReconcileNames { dry_run } => {
-            let report = bridge.reconcile_names(dry_run).await?;
+            let report = build_bridge(&cfg, &db)?.reconcile_names(dry_run).await?;
             println!("{report}");
             Ok(())
         }
