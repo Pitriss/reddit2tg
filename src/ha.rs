@@ -3743,32 +3743,106 @@ impl HaController {
                 Ok(next)
             }
             Err(edit_error) => {
-                // Transport/deadline failures are ambiguous: Telegram may have
-                // committed the edit while only the HTTP response was lost.
-                // Fence later writers at the attempted generation until a
-                // canonical read proves the outcome.
+                // Transport/deadline failures are ambiguous. For an already
+                // active owner, the pre-write lease still gives this process
+                // exclusive write authority until the fail-closed cutoff. If
+                // there is enough time for one more bounded Telegram request,
+                // retry the *exact same* edit instead of guessing from getChat:
+                //
+                // - first write did not commit  -> retry commits it;
+                // - first write did commit      -> Telegram returns
+                //   "message is not modified", which is authoritative too.
+                //
+                // Never do this for claims/elections, where another node may be
+                // writing concurrently.
                 if control_write_error_may_have_committed(&edit_error) {
-                    *self.uncertain_document_write.lock().await = Some(attempted);
-                }
-
-                sleep(Duration::from_millis(120)).await;
-                match self.read_document().await {
-                    Ok(verify)
-                        if control_write_readback_matches(&verify, pinned.message_id, &next) =>
-                    {
+                    let now = now_ms();
+                    let role = *self.role.read().await;
+                    if active_owner_ambiguous_retry_safe(
+                        &self.cfg,
+                        role,
+                        &pinned.document,
+                        &self.cfg.instance_id,
+                        &self.nonce,
+                        now,
+                        self.api.control_request_timeout,
+                    ) {
                         warn!(
                             error = %format!("{edit_error:#}"),
                             message_id = pinned.message_id,
                             generation = next.generation,
-                            "HA control write returned an error but read-back confirms commit"
+                            "HA control write outcome is ambiguous; retrying identical edit while original lease is still exclusive"
                         );
-                        Ok(next)
+
+                        match self.api.edit_document(pinned.message_id, &next).await {
+                            Ok(()) => {
+                                self.accept_document(attempted.clone()).await?;
+                                warn!(
+                                    message_id = pinned.message_id,
+                                    generation = next.generation,
+                                    "HA ambiguous control write resolved by successful identical retry"
+                                );
+                                return Ok(next);
+                            }
+                            Err(retry_error)
+                                if control_write_retry_confirms_commit(&retry_error) =>
+                            {
+                                self.accept_document(attempted.clone()).await?;
+                                warn!(
+                                    message_id = pinned.message_id,
+                                    generation = next.generation,
+                                    "HA ambiguous control write resolved because identical retry reports message is not modified"
+                                );
+                                return Ok(next);
+                            }
+                            Err(retry_error) => {
+                                warn!(
+                                    first_error = %format!("{edit_error:#}"),
+                                    retry_error = %format!("{retry_error:#}"),
+                                    message_id = pinned.message_id,
+                                    generation = next.generation,
+                                    "HA identical retry could not resolve ambiguous control write"
+                                );
+                            }
+                        }
                     }
-                    Ok(_) => Err(edit_error).context(
-                        "HA control document write failed and read-back did not confirm commit",
+
+                    // We still do not know whether Telegram committed the
+                    // attempted document. Fence every later local writer at
+                    // this generation. A later canonical observation of the
+                    // attempted or newer generation clears the fence.
+                    *self.uncertain_document_write.lock().await = Some(attempted);
+                }
+
+                sleep(Duration::from_millis(120)).await;
+
+                // Read raw once for diagnosis/confirmation. Do not pass an
+                // older result through accept_document(): the unresolved-write
+                // fence deliberately rejects it.
+                match self.api.read_pinned().await {
+                    Ok(Some(verify)) => {
+                        self.validate_document(&verify.document)?;
+                        if control_write_readback_matches(&verify, pinned.message_id, &next) {
+                            self.accept_document(verify).await?;
+                            warn!(
+                                error = %format!("{edit_error:#}"),
+                                message_id = pinned.message_id,
+                                generation = next.generation,
+                                "HA control write returned an error but raw read-back confirms commit"
+                            );
+                            return Ok(next);
+                        }
+
+                        Err(edit_error).context(format!(
+                            "HA control document write failed and raw read-back did not confirm commit (observed generation {})",
+                            verify.document.generation
+                        ))
+                    }
+                    Ok(None) => Err(edit_error).context(
+                        "HA control document write failed and raw read-back found no pinned document",
                     ),
                     Err(verify_error) => bail!(
-                        "HA control document write failed: {edit_error:#}; read-back verification failed: {verify_error:#}"
+                        "HA control document write failed: {edit_error:#}; raw read-back verification failed: {verify_error:#}"
                     ),
                 }
             }
@@ -3862,6 +3936,37 @@ fn validate_control_document_progress(
         );
     }
     Ok(())
+}
+
+fn active_owner_ambiguous_retry_safe(
+    cfg: &HaConfig,
+    role: LocalRole,
+    document: &HaDocument,
+    instance_id: &str,
+    nonce: &str,
+    now_ms: i64,
+    request_timeout: Duration,
+) -> bool {
+    if role != LocalRole::Active
+        || document.owner.as_deref() != Some(instance_id)
+        || document.owner_nonce.as_deref() != Some(nonce)
+        || !document.owner_is_live(now_ms)
+    {
+        return false;
+    }
+
+    let fail_closed_ms = (cfg.fail_closed_margin_secs as i64).saturating_mul(1000);
+    let safe_until_ms = document.lease_expires_at_ms.saturating_sub(fail_closed_ms);
+    let retry_budget_ms = request_timeout.as_millis().min(i64::MAX as u128) as i64;
+    let retry_guard_ms = retry_budget_ms.saturating_add(250);
+
+    safe_until_ms > now_ms.saturating_add(retry_guard_ms)
+}
+
+fn control_write_retry_confirms_commit(error: &anyhow::Error) -> bool {
+    format!("{error:#}")
+        .to_ascii_lowercase()
+        .contains("message is not modified")
 }
 
 fn control_write_error_may_have_committed(error: &anyhow::Error) -> bool {
@@ -4729,6 +4834,84 @@ mod tests {
             .expect("exact canonical state should be accepted");
         validate_control_document_progress(&confirmed, &newer, "confirmed control state")
             .expect("newer canonical state should be accepted");
+    }
+
+    #[test]
+    fn active_owner_ambiguous_retry_requires_exclusive_safe_window() {
+        let config = cfg();
+        let mut document = HaDocument::new(&config, 1_000);
+        document.phase = ControlPhase::Lease;
+        document.owner = Some("ostrava".to_owned());
+        document.owner_nonce = Some("process-1".to_owned());
+        document.lease_expires_at_ms = 31_000;
+
+        assert!(active_owner_ambiguous_retry_safe(
+            &config,
+            LocalRole::Active,
+            &document,
+            "ostrava",
+            "process-1",
+            11_000,
+            Duration::from_secs(4),
+        ));
+
+        assert!(!active_owner_ambiguous_retry_safe(
+            &config,
+            LocalRole::Standby,
+            &document,
+            "ostrava",
+            "process-1",
+            11_000,
+            Duration::from_secs(4),
+        ));
+
+        assert!(!active_owner_ambiguous_retry_safe(
+            &config,
+            LocalRole::Active,
+            &document,
+            "ostrava",
+            "other-process",
+            11_000,
+            Duration::from_secs(4),
+        ));
+
+        // With a 5s fail-closed margin and a 4s request deadline, 8s until
+        // lease expiry is not enough room for another authoritative retry.
+        document.lease_expires_at_ms = 19_000;
+        assert!(!active_owner_ambiguous_retry_safe(
+            &config,
+            LocalRole::Active,
+            &document,
+            "ostrava",
+            "process-1",
+            11_000,
+            Duration::from_secs(4),
+        ));
+
+        document.phase = ControlPhase::Claim;
+        document.lease_expires_at_ms = 31_000;
+        assert!(!active_owner_ambiguous_retry_safe(
+            &config,
+            LocalRole::Active,
+            &document,
+            "ostrava",
+            "process-1",
+            11_000,
+            Duration::from_secs(4),
+        ));
+    }
+
+    #[test]
+    fn identical_retry_message_not_modified_confirms_commit() {
+        let confirmed = anyhow::anyhow!(
+            "HA Telegram editMessageText failed (HTTP 400 Bad Request): Bad Request: message is not modified"
+        );
+        assert!(control_write_retry_confirms_commit(&confirmed));
+
+        let unrelated = anyhow::anyhow!(
+            "HA Telegram editMessageText failed (HTTP 400 Bad Request): Bad Request: message text is empty"
+        );
+        assert!(!control_write_retry_confirms_commit(&unrelated));
     }
 
     #[test]
