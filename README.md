@@ -1104,3 +1104,31 @@ and wait for its Reddit/control leases to expire. Protocol 3 can then migrate
 the pinned protocol-2 document in place, preserving the shared Telegram data
 and control update offsets before creating `ha-sync` and publishing the initial
 logical database snapshot.
+
+<!-- ha-v3-checkpoint-gc -->
+### HA replication checkpoint retention and cleanup
+
+The `ha-sync` transport retains two recovery checkpoints. A new checkpoint
+first becomes canonical, the previous current snapshot plus its delta chain is
+kept as the fallback recovery path, and only the checkpoint older than that is
+eligible for deletion.
+
+Every replication upload records both Telegram `file_id` and `message_id`.
+Cleanup uses the HA bot's own outgoing message IDs and the Bot API
+`deleteMessages` method in batches of at most 100 messages. GC is explicitly
+best-effort: a deletion failure is logged and retried, but it never stops the
+bridge or invalidates the active lease.
+
+Telegram only permits normal message deletion for a limited time window, so
+protocol 3 also refreshes the checkpoint by age even when there were no new
+database generations. `replication_snapshot_max_age_secs` defaults to 43200
+(12 hours) and is constrained to at most 64800 (18 hours). With a continuously
+running cluster this keeps the oldest retained checkpoint comfortably inside
+Telegram's 48-hour deletion limit. A cluster that is completely offline for
+more than 48 hours can leave undeletable orphan files in `ha-sync`; this does
+not affect replication correctness.
+
+The canonical HA document persists a compact GC-plan reference. If the active
+node restarts or fails over while cleanup is in progress, the next active node
+can retry the same plan. Snapshot rotation is paused while a GC plan remains
+pending, so the bridge never loses track of more than one cleanup generation.

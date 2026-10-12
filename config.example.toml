@@ -56,6 +56,7 @@ enabled = false
 # replicate_state = true
 # replication_batch_ms = 2000
 # replication_snapshot_every = 100
+# replication_snapshot_max_age_secs = 43200
 # replication_snapshot_chunk_mib = 8
 #
 # [[ha.instances]]

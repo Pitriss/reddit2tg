@@ -28,7 +28,7 @@ const HA_LEGACY_CONTROL_PREFIX: &str = "reddit2tg-ha-v2\n";
 pub const HA_CONTROL_TOPIC_NAME: &str = "ha-control-room";
 pub const HA_SYNC_TOPIC_NAME: &str = "ha-sync";
 const CONTROL_POLL_SECS: u64 = 2;
-const REPLICATION_PAYLOAD_PROTOCOL: u32 = 1;
+const REPLICATION_PAYLOAD_PROTOCOL: u32 = 2;
 const REPLICATION_EPOCH_META: &str = "ha_replication_epoch";
 const REPLICATION_DELTA_CHANGE_LIMIT: usize = 512;
 const REPLICATION_MAX_CHAIN: usize = 10_000;
@@ -100,8 +100,34 @@ pub struct HaRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplicationFilePart {
     pub file_id: String,
+    pub message_id: i64,
     pub sha256: String,
     pub size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicationHeadRef {
+    pub generation: u64,
+    pub file_id: String,
+    pub message_id: i64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicationSnapshotRef {
+    pub generation: u64,
+    pub created_at_ms: i64,
+    pub state_sha256: String,
+    pub manifest_file_id: String,
+    pub manifest_message_id: i64,
+    pub manifest_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicationGcRef {
+    pub file_id: String,
+    pub message_id: i64,
+    pub sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +138,7 @@ struct ReplicationDelta {
     generation: u64,
     previous_generation: u64,
     previous_file_id: Option<String>,
+    previous_message_id: Option<i64>,
     previous_sha256: Option<String>,
     source_instance: String,
     changes: Vec<ReplicationChange>,
@@ -136,6 +163,15 @@ struct ReplicationSnapshotManifest {
     state_sha256: String,
     payload_sha256: String,
     parts: Vec<ReplicationFilePart>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ReplicationGcPlan {
+    protocol: u32,
+    cluster_id: String,
+    epoch: String,
+    created_at_ms: i64,
+    message_ids: Vec<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,17 +216,15 @@ pub struct HaDocument {
     #[serde(default)]
     pub replication_generation: u64,
     #[serde(default)]
-    pub replication_head_file_id: Option<String>,
+    pub replication_head: Option<ReplicationHeadRef>,
     #[serde(default)]
-    pub replication_head_sha256: Option<String>,
+    pub replication_snapshot: Option<ReplicationSnapshotRef>,
     #[serde(default)]
-    pub replication_snapshot_generation: u64,
+    pub replication_previous_snapshot: Option<ReplicationSnapshotRef>,
     #[serde(default)]
-    pub replication_snapshot_state_sha256: Option<String>,
+    pub replication_previous_head: Option<ReplicationHeadRef>,
     #[serde(default)]
-    pub replication_snapshot_manifest_file_id: Option<String>,
-    #[serde(default)]
-    pub replication_snapshot_manifest_sha256: Option<String>,
+    pub replication_gc: Option<ReplicationGcRef>,
 }
 
 impl HaDocument {
@@ -226,12 +260,11 @@ impl HaDocument {
             sync_thread_id: None,
             replication_epoch: None,
             replication_generation: 0,
-            replication_head_file_id: None,
-            replication_head_sha256: None,
-            replication_snapshot_generation: 0,
-            replication_snapshot_state_sha256: None,
-            replication_snapshot_manifest_file_id: None,
-            replication_snapshot_manifest_sha256: None,
+            replication_head: None,
+            replication_snapshot: None,
+            replication_previous_snapshot: None,
+            replication_previous_head: None,
+            replication_gc: None,
         }
     }
 
@@ -327,10 +360,9 @@ struct PinnedDocument {
 }
 
 #[derive(Debug, Clone)]
-struct SnapshotUpload {
-    state_sha256: String,
-    manifest_file_id: String,
-    manifest_sha256: String,
+struct SentReplicationFile {
+    file_id: String,
+    message_id: i64,
 }
 
 #[derive(Clone)]
@@ -481,7 +513,7 @@ impl HaTelegramClient {
         file_name: &str,
         caption: &str,
         data: &[u8],
-    ) -> Result<String> {
+    ) -> Result<SentReplicationFile> {
         let url = format!("{}/sendDocument", self.base);
 
         for retry in 0..=MAX_CONTROL_RATE_LIMIT_RETRIES {
@@ -511,12 +543,20 @@ impl HaTelegramClient {
                 let message = parsed
                     .result
                     .context("HA Telegram sendDocument returned ok without result")?;
-                return message
+                let message_id = message
+                    .get("message_id")
+                    .and_then(Value::as_i64)
+                    .context("HA Telegram sendDocument response has no message_id")?;
+                let file_id = message
                     .get("document")
                     .and_then(|document| document.get("file_id"))
                     .and_then(Value::as_str)
                     .map(str::to_owned)
-                    .context("HA Telegram sendDocument response has no document.file_id");
+                    .context("HA Telegram sendDocument response has no document.file_id")?;
+                return Ok(SentReplicationFile {
+                    file_id,
+                    message_id,
+                });
             }
 
             if let Some(retry_after) = parsed
@@ -539,6 +579,61 @@ impl HaTelegramClient {
         }
 
         unreachable!()
+    }
+
+    async fn delete_messages_best_effort(&self, message_ids: &[i64]) -> (usize, usize) {
+        let mut deleted = 0usize;
+        let mut failed = 0usize;
+
+        for chunk in message_ids.chunks(100) {
+            if chunk.is_empty() {
+                continue;
+            }
+
+            let bulk: Result<bool> = self
+                .call(
+                    "deleteMessages",
+                    &serde_json::json!({
+                        "chat_id": self.chat_id,
+                        "message_ids": chunk,
+                    }),
+                )
+                .await;
+
+            if bulk.is_ok() {
+                deleted = deleted.saturating_add(chunk.len());
+                continue;
+            }
+
+            warn!(
+                count = chunk.len(),
+                "HA replication bulk GC delete failed; retrying messages individually"
+            );
+            for message_id in chunk {
+                let single: Result<bool> = self
+                    .call(
+                        "deleteMessage",
+                        &serde_json::json!({
+                            "chat_id": self.chat_id,
+                            "message_id": message_id,
+                        }),
+                    )
+                    .await;
+                match single {
+                    Ok(_) => deleted = deleted.saturating_add(1),
+                    Err(error) => {
+                        failed = failed.saturating_add(1);
+                        warn!(
+                            error = %format!("{error:#}"),
+                            message_id,
+                            "HA replication artifact could not be deleted; leaving harmless orphan"
+                        );
+                    }
+                }
+            }
+        }
+
+        (deleted, failed)
     }
 
     async fn download_replication_file(&self, file_id: &str) -> Result<Vec<u8>> {
@@ -1205,6 +1300,14 @@ impl HaController {
         let owned_active =
             self.owned_by_this_process(&document) && document.owner_is_live(now_ms());
         if owned_active {
+            if let Err(error) = self.retry_replication_gc_locked().await {
+                warn!(
+                    error = %format!("{error:#}"),
+                    instance_id = %self.cfg.instance_id,
+                    "HA replication garbage collection failed; bridge continues and GC will retry"
+                );
+            }
+
             let now = now_ms();
             let last = *self.last_replication_flush_ms.lock().await;
             if now.saturating_sub(last) >= self.cfg.replication_batch_ms.min(i64::MAX as u64) as i64
@@ -1213,6 +1316,14 @@ impl HaController {
                 *self.last_replication_flush_ms.lock().await = now;
             }
             self.maybe_publish_snapshot_locked(db).await?;
+
+            if let Err(error) = self.retry_replication_gc_locked().await {
+                warn!(
+                    error = %format!("{error:#}"),
+                    instance_id = %self.cfg.instance_id,
+                    "HA replication garbage collection failed after checkpoint; bridge continues"
+                );
+            }
         } else {
             self.catch_up_replication_locked(db, &document).await?;
         }
@@ -1223,17 +1334,29 @@ impl HaController {
         let Some(epoch) = document.replication_epoch.as_deref() else {
             return Ok(false);
         };
-        if document.sync_thread_id.is_none()
-            || document.replication_snapshot_manifest_file_id.is_none()
-            || document.replication_snapshot_manifest_sha256.is_none()
-            || document.replication_snapshot_state_sha256.is_none()
-        {
+        let Some(snapshot) = document.replication_snapshot.as_ref() else {
+            return Ok(false);
+        };
+        if document.sync_thread_id.is_none() {
             return Ok(false);
         }
         if db.get_meta(REPLICATION_EPOCH_META)?.as_deref() != Some(epoch) {
             return Ok(false);
         }
         if db.replication_generation()? != document.replication_generation {
+            return Ok(false);
+        }
+        if document.replication_generation > snapshot.generation {
+            if document
+                .replication_head
+                .as_ref()
+                .is_none_or(|head| head.generation != document.replication_generation)
+            {
+                return Ok(false);
+            }
+        } else if document.replication_generation == snapshot.generation
+            && document.replication_head.is_some()
+        {
             return Ok(false);
         }
         if !db.pending_replication_changes(1)?.is_empty() {
@@ -1281,14 +1404,11 @@ impl HaController {
 
                 document.replication_epoch = Some(epoch.clone());
                 document.replication_generation = snapshot.generation;
-                document.replication_head_file_id = None;
-                document.replication_head_sha256 = None;
-                document.replication_snapshot_generation = snapshot.generation;
-                document.replication_snapshot_state_sha256 = Some(upload.state_sha256.clone());
-                document.replication_snapshot_manifest_file_id =
-                    Some(upload.manifest_file_id.clone());
-                document.replication_snapshot_manifest_sha256 =
-                    Some(upload.manifest_sha256.clone());
+                document.replication_head = None;
+                document.replication_snapshot = Some(upload.clone());
+                document.replication_previous_snapshot = None;
+                document.replication_previous_head = None;
+                document.replication_gc = None;
                 document.data_update_offset =
                     document.data_update_offset.max(local_telegram_offset);
                 Ok(())
@@ -1347,8 +1467,18 @@ impl HaController {
                 epoch: epoch.to_owned(),
                 generation: document.replication_generation.saturating_add(1),
                 previous_generation: document.replication_generation,
-                previous_file_id: document.replication_head_file_id.clone(),
-                previous_sha256: document.replication_head_sha256.clone(),
+                previous_file_id: document
+                    .replication_head
+                    .as_ref()
+                    .map(|head| head.file_id.clone()),
+                previous_message_id: document
+                    .replication_head
+                    .as_ref()
+                    .map(|head| head.message_id),
+                previous_sha256: document
+                    .replication_head
+                    .as_ref()
+                    .map(|head| head.sha256.clone()),
                 source_instance: self.cfg.instance_id.clone(),
                 changes: changes.clone(),
             };
@@ -1372,7 +1502,7 @@ impl HaController {
             "reddit2tg HA delta · generation {} · source {}",
             delta.generation, self.cfg.instance_id
         );
-        let file_id = self
+        let sent = self
             .api
             .send_replication_file(thread_id, &file_name, &caption, &sealed)
             .await?;
@@ -1395,14 +1525,20 @@ impl HaController {
                     bail!("HA replication head changed before delta commit");
                 }
                 current.replication_generation = delta.generation;
-                current.replication_head_file_id = Some(file_id.clone());
-                current.replication_head_sha256 = Some(sealed_sha256.clone());
+                current.replication_head = Some(ReplicationHeadRef {
+                    generation: delta.generation,
+                    file_id: sent.file_id.clone(),
+                    message_id: sent.message_id,
+                    sha256: sealed_sha256.clone(),
+                });
                 Ok(())
             })
             .await?;
 
         if committed.replication_generation != delta.generation
-            || committed.replication_head_file_id.as_deref() != Some(file_id.as_str())
+            || committed.replication_head.as_ref().is_none_or(|head| {
+                head.file_id != sent.file_id || head.message_id != sent.message_id
+            })
         {
             bail!("HA replication delta upload was not committed as canonical head");
         }
@@ -1423,14 +1559,14 @@ impl HaController {
 
     async fn maybe_publish_snapshot_locked(&self, db: &Db) -> Result<()> {
         let document = self.read_document().await?.document;
-        if !self.owned_by_this_process(&document) || !document.owner_is_live(now_ms()) {
+        let now = now_ms();
+        if !self.owned_by_this_process(&document) || !document.owner_is_live(now) {
             return Ok(());
         }
-        if document
-            .replication_generation
-            .saturating_sub(document.replication_snapshot_generation)
-            < self.cfg.replication_snapshot_every
-        {
+        if document.replication_gc.is_some() {
+            return Ok(());
+        }
+        if !replication_snapshot_due(&self.cfg, &document, now) {
             return Ok(());
         }
         if db.replication_generation()? != document.replication_generation {
@@ -1448,37 +1584,259 @@ impl HaController {
             .sync_thread_id
             .context("HA replication snapshot has no ha-sync topic")?;
         let snapshot = db.export_replication_snapshot()?;
-        let upload = self.upload_snapshot(thread_id, epoch, &snapshot).await?;
+        if snapshot.generation != document.replication_generation {
+            bail!("HA checkpoint snapshot generation changed during export");
+        }
+
+        let garbage_ids = self
+            .collect_previous_recovery_message_ids(&document)
+            .await?;
+        let gc_ref = if garbage_ids.is_empty() {
+            None
+        } else {
+            Some(self.upload_gc_plan(thread_id, epoch, garbage_ids).await?)
+        };
+        let uploaded_snapshot = self.upload_snapshot(thread_id, epoch, &snapshot).await?;
 
         let instance_id = self.cfg.instance_id.clone();
         let nonce = self.nonce.to_string();
         let expected_epoch = epoch.to_owned();
-        self.update_document(|current| {
-            if current.owner.as_deref() != Some(instance_id.as_str())
-                || current.owner_nonce.as_deref() != Some(nonce.as_str())
-                || !current.owner_is_live(now_ms())
-            {
-                return Ok(());
-            }
-            if current.replication_epoch.as_deref() != Some(expected_epoch.as_str())
-                || current.replication_generation != snapshot.generation
-            {
-                return Ok(());
-            }
-            current.replication_snapshot_generation = snapshot.generation;
-            current.replication_snapshot_state_sha256 = Some(upload.state_sha256.clone());
-            current.replication_snapshot_manifest_file_id = Some(upload.manifest_file_id.clone());
-            current.replication_snapshot_manifest_sha256 = Some(upload.manifest_sha256.clone());
-            Ok(())
-        })
-        .await?;
+        let expected_snapshot = document.replication_snapshot.clone();
+        let expected_head = document.replication_head.clone();
+        let committed = self
+            .update_document(|current| {
+                if current.owner.as_deref() != Some(instance_id.as_str())
+                    || current.owner_nonce.as_deref() != Some(nonce.as_str())
+                    || !current.owner_is_live(now_ms())
+                {
+                    return Ok(());
+                }
+                if current.replication_epoch.as_deref() != Some(expected_epoch.as_str())
+                    || current.replication_generation != snapshot.generation
+                    || current.replication_snapshot != expected_snapshot
+                    || current.replication_head != expected_head
+                    || current.replication_gc.is_some()
+                {
+                    return Ok(());
+                }
+
+                rotate_replication_checkpoint(current, uploaded_snapshot.clone(), gc_ref.clone())
+            })
+            .await?;
+
+        if committed.replication_snapshot.as_ref() != Some(&uploaded_snapshot) {
+            bail!("HA replication checkpoint snapshot was not committed as canonical root");
+        }
 
         info!(
             instance_id = %self.cfg.instance_id,
             replication_generation = snapshot.generation,
+            previous_snapshot_generation = committed
+                .replication_previous_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.generation),
+            gc_pending = committed.replication_gc.is_some(),
             "HA replication checkpoint snapshot published"
         );
         Ok(())
+    }
+
+    async fn retry_replication_gc_locked(&self) -> Result<()> {
+        let document = self.read_document().await?.document;
+        if !self.owned_by_this_process(&document) || !document.owner_is_live(now_ms()) {
+            return Ok(());
+        }
+        let Some(gc_ref) = document.replication_gc.clone() else {
+            return Ok(());
+        };
+        let epoch = document
+            .replication_epoch
+            .as_deref()
+            .context("HA replication GC has no epoch")?;
+
+        let sealed = self.api.download_replication_file(&gc_ref.file_id).await?;
+        if sha256_hex(&sealed) != gc_ref.sha256 {
+            bail!("HA replication GC plan SHA256 mismatch");
+        }
+        let aad = format!("gc:{}:{}", self.cfg.cluster_id, epoch);
+        let (plan, _): (ReplicationGcPlan, String) =
+            open_json(&sealed, &self.replication_key, &aad)?;
+        if plan.protocol != REPLICATION_PAYLOAD_PROTOCOL
+            || plan.cluster_id != self.cfg.cluster_id
+            || plan.epoch != epoch
+        {
+            bail!("HA replication GC plan does not match canonical state");
+        }
+
+        let (deleted_messages, orphan_messages) = self
+            .api
+            .delete_messages_best_effort(&plan.message_ids)
+            .await;
+
+        let instance_id = self.cfg.instance_id.clone();
+        let nonce = self.nonce.to_string();
+        let expected_gc = gc_ref.clone();
+        let cleared = self
+            .update_document(|current| {
+                if current.owner.as_deref() != Some(instance_id.as_str())
+                    || current.owner_nonce.as_deref() != Some(nonce.as_str())
+                    || !current.owner_is_live(now_ms())
+                {
+                    return Ok(());
+                }
+                if current.replication_gc.as_ref() == Some(&expected_gc) {
+                    current.replication_gc = None;
+                }
+                Ok(())
+            })
+            .await?;
+
+        if cleared.replication_gc.is_none() {
+            let (_, plan_orphans) = self
+                .api
+                .delete_messages_best_effort(&[gc_ref.message_id])
+                .await;
+            info!(
+                instance_id = %self.cfg.instance_id,
+                deleted_messages,
+                orphan_messages = orphan_messages.saturating_add(plan_orphans),
+                "HA replication garbage collection completed"
+            );
+        }
+        Ok(())
+    }
+
+    async fn upload_gc_plan(
+        &self,
+        thread_id: i64,
+        epoch: &str,
+        mut message_ids: Vec<i64>,
+    ) -> Result<ReplicationGcRef> {
+        message_ids.sort_unstable();
+        message_ids.dedup();
+        let plan = ReplicationGcPlan {
+            protocol: REPLICATION_PAYLOAD_PROTOCOL,
+            cluster_id: self.cfg.cluster_id.clone(),
+            epoch: epoch.to_owned(),
+            created_at_ms: now_ms(),
+            message_ids,
+        };
+        let aad = format!("gc:{}:{}", self.cfg.cluster_id, epoch);
+        let (sealed, _) = seal_json(&plan, &self.replication_key, &aad)?;
+        let sha256 = sha256_hex(&sealed);
+        let sent = self
+            .api
+            .send_replication_file(
+                thread_id,
+                &format!(
+                    "reddit2tg-ha-gc-{:020}.bin",
+                    self.read_document().await?.document.replication_generation
+                ),
+                "reddit2tg HA replication GC plan",
+                &sealed,
+            )
+            .await?;
+        Ok(ReplicationGcRef {
+            file_id: sent.file_id,
+            message_id: sent.message_id,
+            sha256,
+        })
+    }
+
+    async fn collect_previous_recovery_message_ids(
+        &self,
+        document: &HaDocument,
+    ) -> Result<Vec<i64>> {
+        let Some(snapshot) = document.replication_previous_snapshot.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let epoch = document
+            .replication_epoch
+            .as_deref()
+            .context("HA previous recovery checkpoint has no epoch")?;
+        let manifest = self.download_snapshot_manifest(epoch, snapshot).await?;
+
+        let mut ids = manifest
+            .parts
+            .iter()
+            .map(|part| part.message_id)
+            .collect::<Vec<_>>();
+        ids.push(snapshot.manifest_message_id);
+
+        if let Some(head) = document.replication_previous_head.as_ref() {
+            ids.extend(
+                self.collect_delta_message_ids(epoch, head, snapshot.generation)
+                    .await?,
+            );
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    async fn collect_delta_message_ids(
+        &self,
+        epoch: &str,
+        head: &ReplicationHeadRef,
+        stop_generation: u64,
+    ) -> Result<Vec<i64>> {
+        if head.generation < stop_generation {
+            bail!("HA previous delta head is older than its snapshot");
+        }
+        if head.generation == stop_generation {
+            return Ok(Vec::new());
+        }
+
+        let mut generation = head.generation;
+        let mut file_id = head.file_id.clone();
+        let mut message_id = head.message_id;
+        let mut expected_sha256 = head.sha256.clone();
+        let mut seen_files = HashSet::new();
+        let mut ids = Vec::new();
+
+        while generation > stop_generation {
+            if ids.len() >= REPLICATION_MAX_CHAIN {
+                bail!("HA replication GC delta chain exceeds safety limit");
+            }
+            if !seen_files.insert(file_id.clone()) {
+                bail!("HA replication GC delta chain contains a loop");
+            }
+
+            ids.push(message_id);
+            let sealed = self.api.download_replication_file(&file_id).await?;
+            if sha256_hex(&sealed) != expected_sha256 {
+                bail!("HA replication GC delta SHA256 mismatch at generation {generation}");
+            }
+            let aad = format!("delta:{}:{}", self.cfg.cluster_id, epoch);
+            let (delta, _): (ReplicationDelta, String) =
+                open_json(&sealed, &self.replication_key, &aad)?;
+            if delta.protocol != REPLICATION_PAYLOAD_PROTOCOL
+                || delta.cluster_id != self.cfg.cluster_id
+                || delta.epoch != epoch
+                || delta.generation != generation
+                || delta.previous_generation.saturating_add(1) != delta.generation
+            {
+                bail!("HA replication GC delta does not match canonical chain");
+            }
+
+            generation = delta.previous_generation;
+            if generation > stop_generation {
+                file_id = delta
+                    .previous_file_id
+                    .context("HA replication GC delta chain ended too early")?;
+                message_id = delta
+                    .previous_message_id
+                    .context("HA replication GC delta chain has no previous message_id")?;
+                expected_sha256 = delta
+                    .previous_sha256
+                    .context("HA replication GC delta chain has no previous SHA256")?;
+            }
+        }
+
+        if generation != stop_generation {
+            bail!("HA replication GC delta chain cannot reach previous snapshot");
+        }
+        Ok(ids)
     }
 
     async fn catch_up_replication_locked(&self, db: &Db, document: &HaDocument) -> Result<()> {
@@ -1493,11 +1851,15 @@ impl HaController {
         let local_epoch = db.get_meta(REPLICATION_EPOCH_META)?;
         let pending_local_changes = !db.pending_replication_changes(1)?.is_empty();
         let mut local_generation = db.replication_generation()?;
+        let current_snapshot = document
+            .replication_snapshot
+            .as_ref()
+            .context("HA replication snapshot is missing")?;
 
         let must_restore_snapshot = local_epoch.as_deref() != Some(epoch)
             || pending_local_changes
             || local_generation > document.replication_generation
-            || local_generation < document.replication_snapshot_generation;
+            || local_generation < current_snapshot.generation;
 
         if must_restore_snapshot {
             self.apply_snapshot_from_document(db, document).await?;
@@ -1525,34 +1887,55 @@ impl HaController {
             .replication_epoch
             .as_deref()
             .context("HA snapshot has no replication epoch")?;
-        let manifest_file_id = document
-            .replication_snapshot_manifest_file_id
-            .as_deref()
-            .context("HA snapshot manifest file_id is missing")?;
-        let manifest_sha256 = document
-            .replication_snapshot_manifest_sha256
-            .as_deref()
-            .context("HA snapshot manifest SHA256 is missing")?;
-        let expected_state_sha256 = document
-            .replication_snapshot_state_sha256
-            .as_deref()
-            .context("HA snapshot state SHA256 is missing")?;
+        let current = document
+            .replication_snapshot
+            .as_ref()
+            .context("HA current snapshot reference is missing")?;
 
-        let manifest_bytes = self.api.download_replication_file(manifest_file_id).await?;
-        if sha256_hex(&manifest_bytes) != manifest_sha256 {
-            bail!("HA replication snapshot manifest SHA256 mismatch");
+        match self.apply_snapshot_ref(db, epoch, current).await {
+            Ok(()) => Ok(()),
+            Err(current_error) => {
+                let Some(previous) = document.replication_previous_snapshot.as_ref() else {
+                    return Err(current_error).context(
+                        "current HA snapshot failed and no previous recovery checkpoint exists",
+                    );
+                };
+                warn!(
+                    error = %format!("{current_error:#}"),
+                    current_generation = current.generation,
+                    previous_generation = previous.generation,
+                    "current HA snapshot failed; trying previous recovery checkpoint"
+                );
+                self.apply_snapshot_ref(db, epoch, previous).await?;
+                if previous.generation < current.generation {
+                    let head = document
+                        .replication_previous_head
+                        .as_ref()
+                        .context("previous HA snapshot needs a retained delta chain")?;
+                    self.apply_delta_chain_from_head(
+                        db,
+                        epoch,
+                        previous.generation,
+                        current.generation,
+                        head,
+                    )
+                    .await?;
+                }
+                if db.replication_generation()? != current.generation {
+                    bail!("previous HA recovery checkpoint did not reconstruct current snapshot generation");
+                }
+                Ok(())
+            }
         }
-        let manifest: ReplicationSnapshotManifest =
-            serde_json::from_slice(&manifest_bytes).context("parse HA snapshot manifest")?;
-        if manifest.protocol != REPLICATION_PAYLOAD_PROTOCOL
-            || manifest.cluster_id != self.cfg.cluster_id
-            || manifest.epoch != epoch
-            || manifest.generation != document.replication_snapshot_generation
-            || manifest.state_sha256 != expected_state_sha256
-        {
-            bail!("HA replication snapshot manifest does not match canonical state");
-        }
+    }
 
+    async fn apply_snapshot_ref(
+        &self,
+        db: &Db,
+        epoch: &str,
+        snapshot: &ReplicationSnapshotRef,
+    ) -> Result<()> {
+        let manifest = self.download_snapshot_manifest(epoch, snapshot).await?;
         let mut sealed = Vec::new();
         for part in &manifest.parts {
             let bytes = self.api.download_replication_file(&part.file_id).await?;
@@ -1591,25 +1974,72 @@ impl HaController {
         Ok(())
     }
 
+    async fn download_snapshot_manifest(
+        &self,
+        epoch: &str,
+        snapshot: &ReplicationSnapshotRef,
+    ) -> Result<ReplicationSnapshotManifest> {
+        let manifest_bytes = self
+            .api
+            .download_replication_file(&snapshot.manifest_file_id)
+            .await?;
+        if sha256_hex(&manifest_bytes) != snapshot.manifest_sha256 {
+            bail!("HA replication snapshot manifest SHA256 mismatch");
+        }
+        let manifest: ReplicationSnapshotManifest =
+            serde_json::from_slice(&manifest_bytes).context("parse HA snapshot manifest")?;
+        if manifest.protocol != REPLICATION_PAYLOAD_PROTOCOL
+            || manifest.cluster_id != self.cfg.cluster_id
+            || manifest.epoch != epoch
+            || manifest.generation != snapshot.generation
+            || manifest.state_sha256 != snapshot.state_sha256
+        {
+            bail!("HA replication snapshot manifest does not match canonical state");
+        }
+        Ok(manifest)
+    }
+
     async fn apply_delta_chain(
         &self,
         db: &Db,
         document: &HaDocument,
         local_generation: u64,
     ) -> Result<()> {
+        if local_generation >= document.replication_generation {
+            return Ok(());
+        }
         let epoch = document
             .replication_epoch
             .as_deref()
             .context("HA delta chain has no replication epoch")?;
-        let mut generation = document.replication_generation;
-        let mut file_id = document
-            .replication_head_file_id
-            .clone()
-            .context("HA replication head file_id is missing")?;
-        let mut expected_sha256 = document
-            .replication_head_sha256
-            .clone()
-            .context("HA replication head SHA256 is missing")?;
+        let head = document
+            .replication_head
+            .as_ref()
+            .context("HA replication head is missing")?;
+        self.apply_delta_chain_from_head(
+            db,
+            epoch,
+            local_generation,
+            document.replication_generation,
+            head,
+        )
+        .await
+    }
+
+    async fn apply_delta_chain_from_head(
+        &self,
+        db: &Db,
+        epoch: &str,
+        local_generation: u64,
+        target_generation: u64,
+        head: &ReplicationHeadRef,
+    ) -> Result<()> {
+        if head.generation != target_generation {
+            bail!("HA replication head generation does not match target");
+        }
+        let mut generation = target_generation;
+        let mut file_id = head.file_id.clone();
+        let mut expected_sha256 = head.sha256.clone();
         let mut seen_files = HashSet::new();
         let mut reverse_chain = Vec::new();
 
@@ -1680,7 +2110,7 @@ impl HaController {
         thread_id: i64,
         epoch: &str,
         snapshot: &ReplicationSnapshot,
-    ) -> Result<SnapshotUpload> {
+    ) -> Result<ReplicationSnapshotRef> {
         let envelope = ReplicationSnapshotEnvelope {
             protocol: REPLICATION_PAYLOAD_PROTOCOL,
             cluster_id: self.cfg.cluster_id.clone(),
@@ -1709,12 +2139,13 @@ impl HaController {
                 chunks.len(),
                 self.cfg.instance_id
             );
-            let file_id = self
+            let sent = self
                 .api
                 .send_replication_file(thread_id, &file_name, &caption, chunk)
                 .await?;
             parts.push(ReplicationFilePart {
-                file_id,
+                file_id: sent.file_id,
+                message_id: sent.message_id,
                 sha256: sha256_hex(chunk),
                 size: chunk.len() as u64,
             });
@@ -1740,7 +2171,7 @@ impl HaController {
             "reddit2tg HA snapshot manifest · generation {} · source {}",
             snapshot.generation, self.cfg.instance_id
         );
-        let manifest_file_id = self
+        let manifest_sent = self
             .api
             .send_replication_file(
                 thread_id,
@@ -1750,9 +2181,12 @@ impl HaController {
             )
             .await?;
 
-        Ok(SnapshotUpload {
+        Ok(ReplicationSnapshotRef {
+            generation: snapshot.generation,
+            created_at_ms: now_ms(),
             state_sha256,
-            manifest_file_id,
+            manifest_file_id: manifest_sent.file_id,
+            manifest_message_id: manifest_sent.message_id,
             manifest_sha256,
         })
     }
@@ -2724,7 +3158,7 @@ impl HaController {
             .max(0)
             / 1000;
         Ok(format!(
-            "reddit2tg HA status\ncluster: {}\nReddit phase: {}\nReddit owner: {}\nReddit lease: {}s\nhandover: {}\nHA command poller: {}\nHA command lease: {}s\nha-sync thread: {}\nreplication generation: {}\nsnapshot generation: {}\ndata update offset: {}\ncontrol update offset: {}\ngeneration: {}",
+            "reddit2tg HA status\ncluster: {}\nReddit phase: {}\nReddit owner: {}\nReddit lease: {}s\nhandover: {}\nHA command poller: {}\nHA command lease: {}s\nha-sync thread: {}\nreplication generation: {}\nsnapshot generation: {}\nprevious snapshot: {}\nreplication GC: {}\ndata update offset: {}\ncontrol update offset: {}\ngeneration: {}",
             self.cfg.cluster_id,
             document.phase.as_str(),
             if document.owner_is_live(now) || document.claim_is_live(now) {
@@ -2745,7 +3179,21 @@ impl HaController {
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "none".to_owned()),
             document.replication_generation,
-            document.replication_snapshot_generation,
+            document
+                .replication_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.generation.to_string())
+                .unwrap_or_else(|| "none".to_owned()),
+            document
+                .replication_previous_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.generation.to_string())
+                .unwrap_or_else(|| "none".to_owned()),
+            if document.replication_gc.is_some() {
+                "pending"
+            } else {
+                "clean"
+            },
             document.data_update_offset,
             document.control_update_offset,
             document.generation
@@ -2837,12 +3285,11 @@ impl HaController {
         next.sync_thread_id = None;
         next.replication_epoch = None;
         next.replication_generation = 0;
-        next.replication_head_file_id = None;
-        next.replication_head_sha256 = None;
-        next.replication_snapshot_generation = 0;
-        next.replication_snapshot_state_sha256 = None;
-        next.replication_snapshot_manifest_file_id = None;
-        next.replication_snapshot_manifest_sha256 = None;
+        next.replication_head = None;
+        next.replication_snapshot = None;
+        next.replication_previous_snapshot = None;
+        next.replication_previous_head = None;
+        next.replication_gc = None;
 
         self.api.edit_document(fresh.message_id, &next).await?;
         sleep(Duration::from_millis(150)).await;
@@ -2996,6 +3443,9 @@ pub fn validate_config(cfg: &HaConfig) -> Result<()> {
     if !(10..=10_000).contains(&cfg.replication_snapshot_every) {
         bail!("ha.replication_snapshot_every must be in 10..10000");
     }
+    if !(3_600..=64_800).contains(&cfg.replication_snapshot_max_age_secs) {
+        bail!("ha.replication_snapshot_max_age_secs must be in 3600..64800 so two retained checkpoints stay below Telegram's 48-hour deletion window");
+    }
     if !(1..=16).contains(&cfg.replication_snapshot_chunk_mib) {
         bail!("ha.replication_snapshot_chunk_mib must be in 1..16");
     }
@@ -3097,7 +3547,7 @@ fn legacy_v2_document_matches_config(cfg: &HaConfig, document: &HaDocument) -> b
 
 pub fn members_fingerprint(cfg: &HaConfig) -> String {
     let mut bytes = format!(
-        "thread={};ttl={};renew={};settle={};margin={};replicate={};batch={};snapshot={};chunk={};",
+        "thread={};ttl={};renew={};settle={};margin={};replicate={};batch={};snapshot={};snapshot_age={};chunk={};",
         cfg.control_thread_id,
         cfg.lease_ttl_secs,
         cfg.renew_interval_secs,
@@ -3106,6 +3556,7 @@ pub fn members_fingerprint(cfg: &HaConfig) -> String {
         cfg.replicate_state,
         cfg.replication_batch_ms,
         cfg.replication_snapshot_every,
+        cfg.replication_snapshot_max_age_secs,
         cfg.replication_snapshot_chunk_mib
     )
     .into_bytes();
@@ -3128,6 +3579,61 @@ pub fn members_fingerprint(cfg: &HaConfig) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{hash:016x}")
+}
+
+fn replication_snapshot_due(cfg: &HaConfig, document: &HaDocument, now_ms: i64) -> bool {
+    let Some(snapshot) = document.replication_snapshot.as_ref() else {
+        return false;
+    };
+    let generation_due = document
+        .replication_generation
+        .saturating_sub(snapshot.generation)
+        >= cfg.replication_snapshot_every;
+    let max_age_ms = (cfg.replication_snapshot_max_age_secs as i64).saturating_mul(1000);
+    let age_due = now_ms.saturating_sub(snapshot.created_at_ms) >= max_age_ms;
+    generation_due || age_due
+}
+
+fn rotate_replication_checkpoint(
+    document: &mut HaDocument,
+    new_snapshot: ReplicationSnapshotRef,
+    gc: Option<ReplicationGcRef>,
+) -> Result<()> {
+    if document.replication_gc.is_some() {
+        bail!("cannot rotate HA replication checkpoint while GC is pending");
+    }
+    if new_snapshot.generation != document.replication_generation {
+        bail!("new HA snapshot generation does not match canonical replication generation");
+    }
+
+    let current_snapshot = document
+        .replication_snapshot
+        .clone()
+        .context("current HA snapshot is missing before checkpoint rotation")?;
+
+    if document.replication_generation > current_snapshot.generation {
+        let current_head = document
+            .replication_head
+            .clone()
+            .context("HA delta head is missing before checkpoint rotation")?;
+        if current_head.generation != document.replication_generation {
+            bail!("HA delta head generation is stale before checkpoint rotation");
+        }
+        document.replication_previous_head = Some(current_head);
+    } else if document.replication_generation == current_snapshot.generation {
+        if document.replication_head.is_some() {
+            bail!("HA replication head must be empty at snapshot generation");
+        }
+        document.replication_previous_head = None;
+    } else {
+        bail!("HA snapshot generation is ahead of canonical replication generation");
+    }
+
+    document.replication_previous_snapshot = Some(current_snapshot);
+    document.replication_snapshot = Some(new_snapshot);
+    document.replication_head = None;
+    document.replication_gc = gc;
+    Ok(())
 }
 
 pub fn document_matches_config(cfg: &HaConfig, document: &HaDocument) -> bool {
@@ -3430,6 +3936,7 @@ mod tests {
             replicate_state: true,
             replication_batch_ms: 2_000,
             replication_snapshot_every: 100,
+            replication_snapshot_max_age_secs: 43_200,
             replication_snapshot_chunk_mib: 8,
             instances: vec![
                 HaInstanceConfig {
@@ -3573,6 +4080,7 @@ mod tests {
             generation: 2,
             previous_generation: 1,
             previous_file_id: None,
+            previous_message_id: None,
             previous_sha256: None,
             source_instance: "doma".to_owned(),
             changes: changes.clone(),
@@ -3637,6 +4145,158 @@ mod tests {
             standby.load_matrix_session().unwrap().unwrap().access_token,
             "standby-local-token"
         );
+    }
+
+    fn snapshot_ref(generation: u64, created_at_ms: i64, suffix: &str) -> ReplicationSnapshotRef {
+        ReplicationSnapshotRef {
+            generation,
+            created_at_ms,
+            state_sha256: format!("state-{suffix}"),
+            manifest_file_id: format!("manifest-file-{suffix}"),
+            manifest_message_id: generation as i64 + 10_000,
+            manifest_sha256: format!("manifest-sha-{suffix}"),
+        }
+    }
+
+    fn head_ref(generation: u64, suffix: &str) -> ReplicationHeadRef {
+        ReplicationHeadRef {
+            generation,
+            file_id: format!("delta-file-{suffix}"),
+            message_id: generation as i64 + 20_000,
+            sha256: format!("delta-sha-{suffix}"),
+        }
+    }
+
+    #[test]
+    fn checkpoint_rotation_keeps_previous_recovery_path_and_resets_head() {
+        let config = cfg();
+        let mut document = HaDocument::new(&config, 1_000);
+        document.replication_generation = 120;
+        document.replication_snapshot = Some(snapshot_ref(100, 1_000, "current"));
+        document.replication_head = Some(head_ref(120, "current-head"));
+        document.replication_previous_snapshot = Some(snapshot_ref(50, 500, "old"));
+        document.replication_previous_head = Some(head_ref(100, "old-head"));
+
+        let new_snapshot = snapshot_ref(120, 2_000, "new");
+        let gc = ReplicationGcRef {
+            file_id: "gc-file".to_owned(),
+            message_id: 30_001,
+            sha256: "gc-sha".to_owned(),
+        };
+        rotate_replication_checkpoint(&mut document, new_snapshot.clone(), Some(gc.clone()))
+            .unwrap();
+
+        assert_eq!(document.replication_snapshot.as_ref(), Some(&new_snapshot));
+        assert_eq!(
+            document
+                .replication_previous_snapshot
+                .as_ref()
+                .unwrap()
+                .generation,
+            100
+        );
+        assert_eq!(
+            document
+                .replication_previous_head
+                .as_ref()
+                .unwrap()
+                .generation,
+            120
+        );
+        assert!(document.replication_head.is_none());
+        assert_eq!(document.replication_gc.as_ref(), Some(&gc));
+    }
+
+    #[test]
+    fn repeated_checkpoint_rotation_keeps_exactly_two_recovery_roots() {
+        let config = cfg();
+        let mut document = HaDocument::new(&config, 1_000);
+        document.replication_generation = 100;
+        document.replication_snapshot = Some(snapshot_ref(50, 500, "s50"));
+        document.replication_head = Some(head_ref(100, "h100"));
+
+        let s100 = snapshot_ref(100, 1_000, "s100");
+        rotate_replication_checkpoint(&mut document, s100.clone(), None).unwrap();
+        assert_eq!(document.replication_snapshot.as_ref(), Some(&s100));
+        assert_eq!(
+            document
+                .replication_previous_snapshot
+                .as_ref()
+                .unwrap()
+                .generation,
+            50
+        );
+        assert_eq!(
+            document
+                .replication_previous_head
+                .as_ref()
+                .unwrap()
+                .generation,
+            100
+        );
+        assert!(document.replication_head.is_none());
+
+        document.replication_generation = 120;
+        document.replication_head = Some(head_ref(120, "h120"));
+        let s120 = snapshot_ref(120, 2_000, "s120");
+        let gc = ReplicationGcRef {
+            file_id: "gc-s50".to_owned(),
+            message_id: 31_000,
+            sha256: "gc-s50-sha".to_owned(),
+        };
+        rotate_replication_checkpoint(&mut document, s120.clone(), Some(gc.clone())).unwrap();
+
+        assert_eq!(document.replication_snapshot.as_ref(), Some(&s120));
+        assert_eq!(document.replication_previous_snapshot.as_ref(), Some(&s100));
+        assert_eq!(
+            document
+                .replication_previous_head
+                .as_ref()
+                .unwrap()
+                .generation,
+            120
+        );
+        assert!(document.replication_head.is_none());
+        assert_eq!(document.replication_gc.as_ref(), Some(&gc));
+    }
+
+    #[test]
+    fn idle_checkpoint_refresh_is_due_before_telegram_delete_window() {
+        let config = cfg();
+        let mut document = HaDocument::new(&config, 1_000);
+        document.replication_generation = 10;
+        document.replication_snapshot = Some(snapshot_ref(10, 1_000, "same-generation"));
+
+        assert!(!replication_snapshot_due(
+            &config,
+            &document,
+            1_000 + 60 * 60 * 1000
+        ));
+        assert!(replication_snapshot_due(
+            &config,
+            &document,
+            1_000 + (config.replication_snapshot_max_age_secs as i64) * 1000
+        ));
+
+        let refreshed = snapshot_ref(10, 2_000, "refreshed");
+        rotate_replication_checkpoint(&mut document, refreshed.clone(), None).unwrap();
+        assert_eq!(document.replication_snapshot.as_ref(), Some(&refreshed));
+        assert_eq!(
+            document
+                .replication_previous_snapshot
+                .as_ref()
+                .unwrap()
+                .generation,
+            10
+        );
+        assert!(document.replication_previous_head.is_none());
+    }
+
+    #[test]
+    fn config_rejects_snapshot_age_that_can_outlive_telegram_gc_window() {
+        let mut config = cfg();
+        config.replication_snapshot_max_age_secs = 64_801;
+        assert!(validate_config(&config).is_err());
     }
 
     #[test]

@@ -89,6 +89,8 @@ pub struct HaConfig {
     pub replication_batch_ms: u64,
     #[serde(default = "default_ha_replication_snapshot_every")]
     pub replication_snapshot_every: u64,
+    #[serde(default = "default_ha_replication_snapshot_max_age_secs")]
+    pub replication_snapshot_max_age_secs: u64,
     #[serde(default = "default_ha_replication_snapshot_chunk_mib")]
     pub replication_snapshot_chunk_mib: u64,
     #[serde(default)]
@@ -110,6 +112,7 @@ impl Default for HaConfig {
             replicate_state: true,
             replication_batch_ms: default_ha_replication_batch_ms(),
             replication_snapshot_every: default_ha_replication_snapshot_every(),
+            replication_snapshot_max_age_secs: default_ha_replication_snapshot_max_age_secs(),
             replication_snapshot_chunk_mib: default_ha_replication_snapshot_chunk_mib(),
             instances: Vec::new(),
         }
@@ -162,6 +165,9 @@ const fn default_ha_replication_batch_ms() -> u64 {
 }
 const fn default_ha_replication_snapshot_every() -> u64 {
     100
+}
+const fn default_ha_replication_snapshot_max_age_secs() -> u64 {
+    12 * 60 * 60
 }
 const fn default_ha_replication_snapshot_chunk_mib() -> u64 {
     8
