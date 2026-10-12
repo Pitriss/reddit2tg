@@ -933,8 +933,8 @@ impl HaController {
         }
     }
 
-    pub async fn shutdown(&self, reddit: &RedditClient) {
-        if let Err(error) = self.graceful_shutdown(reddit).await {
+    pub async fn shutdown(&self, reddit: &RedditClient, db: &Db) {
+        if let Err(error) = self.graceful_shutdown(reddit, db).await {
             warn!(
                 error = %format!("{error:#}"),
                 instance_id = %self.cfg.instance_id,
@@ -1276,7 +1276,38 @@ impl HaController {
 
     pub async fn flush_replication(&self, db: &Db) -> Result<()> {
         let _guard = self.replication_lock.lock().await;
-        self.publish_pending_replication_locked(db).await?;
+        self.flush_all_pending_replication_locked(db).await?;
+        *self.last_replication_flush_ms.lock().await = now_ms();
+        Ok(())
+    }
+
+    async fn flush_all_pending_replication_locked(&self, db: &Db) -> Result<()> {
+        loop {
+            if db.pending_replication_changes(1)?.is_empty() {
+                return Ok(());
+            }
+
+            let before_generation = db.replication_generation()?;
+            self.publish_pending_replication_locked(db).await?;
+            let after_generation = db.replication_generation()?;
+            if after_generation == before_generation {
+                bail!("HA replication flush made no progress at generation {before_generation}");
+            }
+        }
+    }
+
+    async fn flush_replication_before_release(&self, db: &Db) -> Result<()> {
+        let _guard = self.replication_lock.lock().await;
+        self.flush_all_pending_replication_locked(db).await?;
+
+        let document = self.read_document().await?.document;
+        if !self.owned_by_this_process(&document) || !document.owner_is_live(now_ms()) {
+            bail!("HA lease changed or expired before final replication flush");
+        }
+        if !self.replication_ready(db, &document)? {
+            bail!("HA replication is not fully synchronized after final flush");
+        }
+
         *self.last_replication_flush_ms.lock().await = now_ms();
         Ok(())
     }
@@ -1379,7 +1410,7 @@ impl HaController {
             return Ok(());
         }
 
-        let snapshot = db.export_replication_snapshot()?;
+        let (snapshot, baseline_through_seq) = db.export_replication_snapshot_with_watermark()?;
         let epoch = random_epoch()?;
         let upload = self.upload_snapshot(thread_id, &epoch, &snapshot).await?;
         let local_telegram_offset = db
@@ -1416,6 +1447,7 @@ impl HaController {
             .await?;
 
         if updated.replication_epoch.as_deref() == Some(epoch.as_str()) {
+            db.establish_replication_baseline(snapshot.generation, baseline_through_seq)?;
             db.set_meta(REPLICATION_EPOCH_META, &epoch)?;
             info!(
                 instance_id = %self.cfg.instance_id,
@@ -2205,7 +2237,7 @@ impl HaController {
                 InstanceMode::Auto => unreachable!(),
             };
             if self.owned_by_this_process(&document) {
-                self.drain_and_release(reddit, target_role).await?;
+                self.drain_and_release(reddit, db, target_role).await?;
             } else {
                 self.ensure_local_role(reddit, target_role).await?;
             }
@@ -2219,12 +2251,13 @@ impl HaController {
                     .as_deref()
                     .is_some_and(|target| target != instance_id)
                 {
-                    self.drain_and_release(reddit, LocalRole::Standby).await?;
+                    self.drain_and_release(reddit, db, LocalRole::Standby)
+                        .await?;
                     return Ok(());
                 }
 
                 if *self.role.read().await != LocalRole::Active {
-                    self.resume_owned_lease(reddit, &document).await?;
+                    self.resume_owned_lease(reddit, db, &document).await?;
                     return Ok(());
                 }
 
@@ -2458,7 +2491,24 @@ impl HaController {
         Ok(())
     }
 
-    async fn resume_owned_lease(&self, reddit: &RedditClient, observed: &HaDocument) -> Result<()> {
+    async fn resume_owned_lease(
+        &self,
+        reddit: &RedditClient,
+        db: &Db,
+        observed: &HaDocument,
+    ) -> Result<()> {
+        if !self.replication_ready(db, observed)? {
+            warn!(
+                instance_id = %self.cfg.instance_id,
+                replication_generation = observed.replication_generation,
+                "HA owned lease will not resume because local replication is not ready"
+            );
+            reddit.soft_disconnect().await?;
+            *self.role.write().await = LocalRole::Standby;
+            self.release_owned_after_resume_failure().await?;
+            return Ok(());
+        }
+
         let safe_until_ms = observed
             .lease_expires_at_ms
             .saturating_sub((self.cfg.fail_closed_margin_secs as i64) * 1000);
@@ -2473,7 +2523,11 @@ impl HaController {
         match timeout(auth_window, reddit.authenticate()).await {
             Ok(Ok(session)) => {
                 let verify = self.read_document().await?.document;
-                if self.owned_by_this_process(&verify) && verify.owner_is_live(now_ms()) {
+                let replication_ready = self.replication_ready(db, &verify)?;
+                if self.owned_by_this_process(&verify)
+                    && verify.owner_is_live(now_ms())
+                    && replication_ready
+                {
                     *self.lease_expires_at_ms.lock().await = verify.lease_expires_at_ms;
                     *role_guard = LocalRole::Active;
                     info!(
@@ -2502,7 +2556,7 @@ impl HaController {
         reddit.soft_disconnect().await?;
         *role_guard = LocalRole::Standby;
         drop(role_guard);
-        self.release_owned_after_auth_failure().await?;
+        self.release_owned_after_resume_failure().await?;
         Ok(())
     }
 
@@ -2622,7 +2676,7 @@ impl HaController {
         Ok(())
     }
 
-    async fn release_owned_after_auth_failure(&self) -> Result<()> {
+    async fn release_owned_after_resume_failure(&self) -> Result<()> {
         let instance_id = self.cfg.instance_id.clone();
         let nonce = self.nonce.to_string();
         let allow_fallback = member(&self.cfg, &instance_id)
@@ -2643,18 +2697,33 @@ impl HaController {
             document.failover_allowed = allow_fallback;
             document.owner_nonce = None;
             document.claim_started_at_ms = 0;
+            if document.control_owner.as_deref() == Some(instance_id.as_str())
+                && document.control_owner_nonce.as_deref() == Some(nonce.as_str())
+            {
+                document.control_owner = None;
+                document.control_owner_nonce = None;
+                document.control_lease_expires_at_ms = now_ms();
+            }
             Ok(())
         })
         .await?;
         Ok(())
     }
 
-    async fn drain_and_release(&self, reddit: &RedditClient, target_role: LocalRole) -> Result<()> {
+    async fn drain_and_release(
+        &self,
+        reddit: &RedditClient,
+        db: &Db,
+        target_role: LocalRole,
+    ) -> Result<()> {
         let mut role_guard = self.role.write().await;
         *role_guard = LocalRole::Draining;
         *self.lease_expires_at_ms.lock().await = 0;
 
+        // The write lock waits for outstanding ActiveLeasePermit readers and
+        // prevents new bridge operations from starting while we drain.
         reddit.soft_disconnect().await?;
+        self.flush_replication_before_release(db).await?;
 
         let instance_id = self.cfg.instance_id.clone();
         let nonce = self.nonce.to_string();
@@ -2718,17 +2787,23 @@ impl HaController {
         Ok(())
     }
 
-    async fn graceful_shutdown(&self, reddit: &RedditClient) -> Result<()> {
+    async fn graceful_shutdown(&self, reddit: &RedditClient, db: &Db) -> Result<()> {
         let mut role_guard = self.role.write().await;
-        let was_active = matches!(
-            *role_guard,
+        let previous_role = *role_guard;
+        let was_owner_runtime = matches!(
+            previous_role,
             LocalRole::Active | LocalRole::Claiming | LocalRole::Draining
         );
+        let needs_final_flush = matches!(previous_role, LocalRole::Active | LocalRole::Draining);
         *role_guard = LocalRole::Draining;
         *self.lease_expires_at_ms.lock().await = 0;
         reddit.soft_disconnect().await?;
 
-        if was_active {
+        if needs_final_flush {
+            self.flush_replication_before_release(db).await?;
+        }
+
+        if was_owner_runtime {
             let instance_id = self.cfg.instance_id.clone();
             let nonce = self.nonce.to_string();
             let configured = member(&self.cfg, &instance_id)

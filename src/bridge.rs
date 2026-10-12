@@ -1071,7 +1071,7 @@ impl Bridge {
                 let _ = ha_task.await;
                 let _ = matrix_task.await;
                 let _ = telegram_task.await;
-                ha.shutdown(&self.reddit).await;
+                ha.shutdown(&self.reddit, &self.db).await;
                 info!("shutdown requested");
                 Ok(())
             }

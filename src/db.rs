@@ -706,6 +706,10 @@ impl Db {
     }
 
     pub fn export_replication_snapshot(&self) -> Result<ReplicationSnapshot> {
+        Ok(self.export_replication_snapshot_with_watermark()?.0)
+    }
+
+    pub fn export_replication_snapshot_with_watermark(&self) -> Result<(ReplicationSnapshot, i64)> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let generation: i64 = tx.query_row(
@@ -715,6 +719,14 @@ impl Db {
         )?;
         let generation =
             u64::try_from(generation).context("negative HA replication generation in SQLite")?;
+        let published_seq: i64 = tx.query_row(
+            "SELECT published_seq FROM ha_replication_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let max_change_seq: Option<i64> =
+            tx.query_row("SELECT MAX(seq) FROM ha_change_log", [], |row| row.get(0))?;
+        let through_seq = max_change_seq.unwrap_or(published_seq).max(published_seq);
         let mut rows = Vec::new();
 
         append_snapshot_rows(
@@ -835,7 +847,37 @@ impl Db {
         )?;
 
         tx.commit()?;
-        Ok(ReplicationSnapshot { generation, rows })
+        Ok((ReplicationSnapshot { generation, rows }, through_seq))
+    }
+
+    pub fn establish_replication_baseline(&self, generation: u64, through_seq: i64) -> Result<()> {
+        let generation = i64::try_from(generation).context("HA replication generation overflow")?;
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let (current_generation, published_seq): (i64, i64) = tx.query_row(
+            "SELECT applied_generation, published_seq FROM ha_replication_state WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+
+        if current_generation != generation {
+            bail!(
+                "cannot establish HA replication baseline at generation {generation}; local generation is {current_generation}"
+            );
+        }
+        if through_seq < published_seq {
+            bail!(
+                "cannot move HA baseline sequence backwards from {published_seq} to {through_seq}"
+            );
+        }
+
+        tx.execute(
+            "UPDATE ha_replication_state SET published_seq = ?1 WHERE singleton = 1",
+            [through_seq],
+        )?;
+        tx.execute("DELETE FROM ha_change_log WHERE seq <= ?1", [through_seq])?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn apply_replication_snapshot(&self, snapshot: &ReplicationSnapshot) -> Result<()> {
@@ -1826,6 +1868,32 @@ mod replication_tests {
         assert_eq!(changes[0].table, "meta");
         assert!(changes[0].row_json.contains("matrix_next_batch"));
         assert!(!changes[0].row_json.contains("secret-token"));
+    }
+
+    #[test]
+    fn replication_bootstrap_baseline_preserves_post_snapshot_changes() {
+        let db = temp_db("replication-bootstrap-baseline");
+
+        db.upsert_room("!baseline:reddit", 7001, "Baseline", "joined")
+            .unwrap();
+        let (snapshot, through_seq) = db.export_replication_snapshot_with_watermark().unwrap();
+        assert_eq!(snapshot.generation, 0);
+        assert!(through_seq > 0);
+
+        db.set_allow_delete("!baseline:reddit", false).unwrap();
+        let before = db.pending_replication_changes(100).unwrap();
+        assert!(before.len() >= 2);
+        assert!(before.iter().any(|change| change.seq <= through_seq));
+        assert!(before.iter().any(|change| change.seq > through_seq));
+
+        db.establish_replication_baseline(snapshot.generation, through_seq)
+            .unwrap();
+
+        let after = db.pending_replication_changes(100).unwrap();
+        assert!(!after.is_empty());
+        assert!(after.iter().all(|change| change.seq > through_seq));
+        assert!(after.iter().any(|change| change.table == "room_settings"));
+        assert_eq!(db.replication_generation().unwrap(), snapshot.generation);
     }
 
     #[test]
