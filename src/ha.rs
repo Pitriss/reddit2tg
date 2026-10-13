@@ -3683,13 +3683,45 @@ impl HaController {
             Ok(Some(pinned)) => {
                 return self.accept_document(pinned).await;
             }
-            Ok(None) => {}
+            Ok(None) => {
+                // getChat completed successfully and proved that no message is
+                // pinned. Only this kind of conclusive observation may trigger
+                // a repair write.
+                if let Some(message_id) = *self.state_message_id.lock().await {
+                    warn!(
+                        message_id,
+                        "HA control state pin is missing; trying to restore the cached state pin"
+                    );
+                    self.api.ensure_pinned(message_id).await?;
+                    sleep(Duration::from_millis(150)).await;
+                    let pinned = self
+                        .api
+                        .read_pinned()
+                        .await?
+                        .context("cached HA state message was re-pinned but getChat returned no pinned message")?;
+                    return self.accept_document(pinned).await;
+                }
+            }
             Err(first_error) => {
+                // A transport/API/deadline failure says nothing about which
+                // message is currently pinned. Never turn an inconclusive read
+                // into pinChatMessage: that would add a control-plane write
+                // exactly while canonical state is unknown.
+                if control_read_error_is_inconclusive(&first_error) {
+                    bail!(
+                        "HA control document read was inconclusive; refusing to mutate Telegram pin state: {first_error:#}"
+                    );
+                }
+
+                // read_pinned() can also fail after a successful getChat when
+                // the latest pin is definitively not our expected HA state
+                // (wrong topic/type/document). In that case the cached state
+                // message may be safely restored as the latest pin.
                 if let Some(message_id) = *self.state_message_id.lock().await {
                     warn!(
                         error = %format!("{first_error:#}"),
                         message_id,
-                        "HA state is no longer the latest Telegram pin; trying to restore the cached state pin"
+                        "HA pinned message is not the expected control state; trying to restore the cached state pin"
                     );
                     self.api.ensure_pinned(message_id).await?;
                     sleep(Duration::from_millis(150)).await;
@@ -3967,6 +3999,15 @@ fn control_write_retry_confirms_commit(error: &anyhow::Error) -> bool {
     format!("{error:#}")
         .to_ascii_lowercase()
         .contains("message is not modified")
+}
+
+fn control_read_error_is_inconclusive(error: &anyhow::Error) -> bool {
+    // Every failure produced by HaTelegramClient::call("getChat", ...) carries
+    // this method-specific context. Errors produced after a successful getChat
+    // (wrong thread, non-text pin, invalid HA document) intentionally do not.
+    format!("{error:#}")
+        .to_ascii_lowercase()
+        .contains("ha telegram getchat")
 }
 
 fn control_write_error_may_have_committed(error: &anyhow::Error) -> bool {
@@ -4899,6 +4940,40 @@ mod tests {
             11_000,
             Duration::from_secs(4),
         ));
+    }
+
+    #[test]
+    fn getchat_transport_and_api_failures_are_inconclusive() {
+        for error in [
+            anyhow::anyhow!(
+                "HA Telegram getChat request failed: error sending request: operation timed out"
+            ),
+            anyhow::anyhow!("HA Telegram getChat call exceeded control deadline of 4s"),
+            anyhow::anyhow!(
+                "HA Telegram getChat failed (HTTP 500 Internal Server Error): upstream failure"
+            ),
+            anyhow::anyhow!("HA Telegram getChat returned invalid JSON (HTTP 200 OK)"),
+        ] {
+            assert!(
+                control_read_error_is_inconclusive(&error),
+                "getChat API/transport failure must never trigger pin repair: {error:#}"
+            );
+        }
+
+        let wrong_pin =
+            anyhow::anyhow!("latest pinned Telegram message is outside configured HA thread 777");
+        assert!(
+            !control_read_error_is_inconclusive(&wrong_pin),
+            "a successfully observed wrong pin is conclusive"
+        );
+
+        let wrong_document = anyhow::anyhow!(
+            "latest pinned message in configured HA thread 777 is not a reddit2tg HA document"
+        );
+        assert!(
+            !control_read_error_is_inconclusive(&wrong_document),
+            "a successfully observed non-HA pin is conclusive"
+        );
     }
 
     #[test]
